@@ -1,0 +1,10 @@
+{
+  "activity_reactions": true,
+  "micro_idles": true,
+  "mode": "auto",
+  "pace": "normal",
+  "roam_enabled": true,
+  "roam_pattern": "full",
+  "thermal_reactions": true,
+  "version": 1
+}

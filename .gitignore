@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.log
+*.tmp
+*.backup-*
+.DS_Store
+/build/
+/target/
+/generated/
+
+# These belong to the running machine, never the repository.
+lianli-agent-state
+lianli-agent-position
+lianli-agent-command
+lianli-agent-control-status
+lianli-agent-event-*
+mascot-control.json

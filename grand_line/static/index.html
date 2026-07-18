@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Patch Command</title>
+  <link rel="stylesheet" href="/patch.css">
+</head>
+<body>
+  <main class="patch-page">
+    <header>
+      <small>COOLER DISPLAY</small>
+      <h1>PATCH COMMAND</h1>
+      <p>Guide our little coding deckhand around the screen.</p>
+    </header>
+
+    <section class="card status" id="statusCard">
+      <div class="status-head">
+        <span><i></i><b id="service">CHECKING</b></span>
+        <em id="updated">CONTACTING PATCH…</em>
+      </div>
+      <div class="readouts">
+        <div><small>MODE</small><strong id="mode">—</strong></div>
+        <div><small>ANIMATION</small><strong id="state">—</strong></div>
+        <div><small>LOCATION</small><strong id="location">—</strong></div>
+      </div>
+    </section>
+
+    <div class="main-orders">
+      <button data-command="auto"><b>✦</b><span>AUTO WATCH</span><small>Let Patch decide</small></button>
+      <button data-command="home"><b>⌂</b><span>CALL HOME</span><small>Return to his post</small></button>
+    </div>
+
+    <section class="card">
+      <h2><span>SCREEN POSITION</span><em>FULL 3 × 3 GRID</em></h2>
+      <div class="direction-pad">
+        <button data-location="upper-left"><b>↖</b><span>UPPER LEFT</span></button>
+        <button data-location="up"><b>↑</b><span>UP</span></button>
+        <button data-location="upper-right"><b>↗</b><span>UPPER RIGHT</span></button>
+        <button data-location="left"><b>←</b><span>LEFT</span></button>
+        <button data-location="center"><b>●</b><span>CENTER</span></button>
+        <button data-location="right"><b>→</b><span>RIGHT</span></button>
+        <button data-location="lower-left"><b>↙</b><span>LOWER LEFT</span></button>
+        <button data-location="down"><b>↓</b><span>DOWN</span></button>
+        <button data-location="lower-right"><b>↘</b><span>LOWER RIGHT</span></button>
+      </div>
+    </section>
+
+    <section class="card settings">
+      <h2><span>ROAMING</span><em>AUTOPILOT</em></h2>
+      <button class="toggle" data-toggle="roamEnabled" role="switch" aria-checked="false">
+        <span>FREE ROAM</span><i></i>
+      </button>
+      <label>ROUTE</label>
+      <div class="segments">
+        <button data-setting="pattern" data-value="full">FULL</button>
+        <button data-setting="pattern" data-value="horizontal">LEFT ↔ RIGHT</button>
+        <button data-setting="pattern" data-value="vertical">UP ↕ DOWN</button>
+      </div>
+      <label>PACE</label>
+      <div class="segments">
+        <button data-setting="pace" data-value="slow">SLOW</button>
+        <button data-setting="pace" data-value="normal">NORMAL</button>
+        <button data-setting="pace" data-value="quick">QUICK</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2><span>REACTIONS</span><em>LIVE BEHAVIOR</em></h2>
+      <div class="instincts">
+        <button data-toggle="microIdles" aria-pressed="false">MICRO-IDLES</button>
+        <button data-toggle="activityReactions" aria-pressed="false">ACTIVITY</button>
+        <button data-toggle="thermalReactions" aria-pressed="false">THERMALS</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2><span>ANIMATION PREVIEW</span><em>TAP TO PLAY</em></h2>
+      <div class="previews">
+        <button data-preview="tool">⚒<span>TOOL</span></button>
+        <button data-preview="read">▤<span>READ</span></button>
+        <button data-preview="attention">!<span>AHOY!</span></button>
+        <button data-preview="success">★<span>SUCCESS</span></button>
+      </div>
+    </section>
+  </main>
+  <div class="toast" id="toast">ORDER SENT</div>
+  <script src="/patch.js"></script>
+</body>
+</html>

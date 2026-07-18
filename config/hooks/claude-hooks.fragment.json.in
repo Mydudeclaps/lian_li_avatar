@@ -1,0 +1,130 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/timeout --signal=KILL 0.4s @EVENT_BIN@ claude start </dev/null >/dev/null 2>&1",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/timeout --signal=KILL 0.4s @EVENT_BIN@ claude exit </dev/null >/dev/null 2>&1",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^(Read|Glob|Grep|WebFetch|WebSearch)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/timeout --signal=KILL 0.4s @EVENT_BIN@ claude read </dev/null >/dev/null 2>&1",
+            "timeout": 1
+          }
+        ]
+      },
+      {
+        "matcher": "^(Bash|Edit|Write|NotebookEdit|Agent|Task|Skill|TodoWrite|TaskCreate|TaskUpdate|TaskOutput|TaskStop|EnterPlanMode|ExitPlanMode|AskUserQuestion|mcp__.*)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/timeout --signal=KILL 0.4s @EVENT_BIN@ claude tool </dev/null >/dev/null 2>&1",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/timeout --signal=KILL 0.4s @EVENT_BIN@ claude permission </dev/null >/dev/null 2>&1",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "permission_prompt|idle_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/timeout --signal=KILL 0.4s @EVENT_BIN@ claude permission </dev/null >/dev/null 2>&1",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "PermissionDenied": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/timeout --signal=KILL 0.4s @EVENT_BIN@ claude error </dev/null >/dev/null 2>&1",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/timeout --signal=KILL 0.4s @EVENT_BIN@ claude error </dev/null >/dev/null 2>&1",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/timeout --signal=KILL 0.4s @EVENT_BIN@ claude error </dev/null >/dev/null 2>&1",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "TaskCompleted": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/timeout --signal=KILL 0.4s @EVENT_BIN@ claude success </dev/null >/dev/null 2>&1",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/timeout --signal=KILL 0.4s @EVENT_BIN@ claude exit </dev/null >/dev/null 2>&1",
+            "timeout": 1
+          }
+        ]
+      }
+    ]
+  }
+}

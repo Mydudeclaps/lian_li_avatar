@@ -1,0 +1,370 @@
+"""Strict local control bridge for the Patch LCD mascot.
+
+The web server never writes the renderer's state or position files. It stores
+validated preferences and publishes a latest-command record for the watcher,
+which remains the sole owner of visible mascot state.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+import threading
+import time
+from pathlib import Path
+
+
+CONFIG_VERSION = 1
+CONFIG_FILE = Path.home() / ".config" / "lianli" / "mascot-control.json"
+COMMAND_FILE_NAME = "lianli-agent-command"
+CONTROL_STATUS_FILE_NAME = "lianli-agent-control-status"
+STATE_FILE_NAME = "lianli-agent-state"
+POSITION_FILE_NAME = "lianli-agent-position"
+WATCHER_LOCK_FILE_NAME = ".lianli-agent-watch.lock"
+
+LOCATIONS = (
+    "home",
+    "upper-left",
+    "up",
+    "upper-right",
+    "left",
+    "center",
+    "right",
+    "lower-left",
+    "down",
+    "lower-right",
+)
+MOVE_LOCATIONS = tuple(location for location in LOCATIONS if location != "home")
+PREVIEW_EVENTS = ("tool", "read", "attention", "success")
+PATTERNS = ("full", "horizontal", "vertical")
+PACES = ("slow", "normal", "quick")
+
+DEFAULT_CONFIG = {
+    "version": CONFIG_VERSION,
+    "mode": "auto",
+    "roam_enabled": True,
+    "roam_pattern": "full",
+    "pace": "normal",
+    "micro_idles": True,
+    "activity_reactions": True,
+    "thermal_reactions": True,
+}
+
+PUBLIC_TO_DISK = {
+    "roamEnabled": "roam_enabled",
+    "pattern": "roam_pattern",
+    "pace": "pace",
+    "microIdles": "micro_idles",
+    "activityReactions": "activity_reactions",
+    "thermalReactions": "thermal_reactions",
+}
+
+KNOWN_STATES = {
+    "idle",
+    "codex-enter",
+    "codex-active",
+    "codex-wait",
+    "codex-exit",
+    "claude-enter",
+    "claude-active",
+    "claude-wait",
+    "claude-exit",
+    "both-enter",
+    "both-active",
+    "both-wait",
+    "both-exit",
+    "event-error",
+    "event-attention",
+    "event-success",
+    "event-done",
+    "event-tool",
+    "event-reading",
+    "thermal-warm",
+    "thermal-hot",
+    "thermal-critical",
+    "thermal-relief",
+    "idle-blink",
+    "idle-hat-adjust",
+    "idle-stretch",
+    "idle-mug",
+    "idle-gauge",
+    "idle-breeze",
+    "stroll-left",
+    "stroll-right",
+}
+
+# Logical 2288x1048 destinations. These are used only to infer a friendly
+# fallback location when the watcher has not published its control-status file.
+LOGICAL_LOCATIONS = {
+    "upper-left": (300, 200),
+    "up": (1144, 200),
+    "upper-right": (1988, 200),
+    "left": (300, 524),
+    "center": (1144, 524),
+    "right": (1988, 524),
+    "lower-left": (300, 848),
+    "down": (1144, 848),
+    "lower-right": (1988, 848),
+}
+HOME_POINT = (1144, 720)
+
+
+class PatchControlError(ValueError):
+    """A safe client-facing validation error."""
+
+
+def _trusted_runtime_dir() -> Path:
+    uid = os.geteuid()
+    candidates = []
+    configured = os.environ.get("XDG_RUNTIME_DIR")
+    if configured:
+        candidates.append(Path(configured))
+    candidates.append(Path(f"/run/user/{uid}"))
+    for path in candidates:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if path.is_absolute() and path.is_dir() and stat.st_uid == uid:
+            return path
+    raise PatchControlError("No trusted user runtime directory is available")
+
+
+def _atomic_write(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for attempt in range(16):
+        temporary = path.with_name(
+            f".{path.name}.{os.getpid()}.{threading.get_ident()}.{attempt}.tmp"
+        )
+        try:
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            continue
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write(value)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, path)
+            return
+        except BaseException:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+            raise
+    raise OSError("Could not reserve a temporary Patch control file")
+
+
+def _validate_config(value: object) -> dict:
+    if not isinstance(value, dict) or set(value) != set(DEFAULT_CONFIG):
+        raise PatchControlError("Invalid mascot configuration shape")
+    if value.get("version") != CONFIG_VERSION:
+        raise PatchControlError("Unsupported mascot configuration version")
+    if value.get("mode") not in {"auto", "manual"}:
+        raise PatchControlError("mode must be auto or manual")
+    if value.get("roam_pattern") not in PATTERNS:
+        raise PatchControlError("roam_pattern must be full, horizontal, or vertical")
+    if value.get("pace") not in PACES:
+        raise PatchControlError("pace must be slow, normal, or quick")
+    for key in (
+        "roam_enabled",
+        "micro_idles",
+        "activity_reactions",
+        "thermal_reactions",
+    ):
+        if type(value.get(key)) is not bool:
+            raise PatchControlError(f"{key} must be a boolean")
+    return dict(value)
+
+
+def _public_settings(config: dict) -> dict:
+    return {
+        public: config[disk]
+        for public, disk in PUBLIC_TO_DISK.items()
+    }
+
+
+class PatchControl:
+    def __init__(
+        self,
+        config_file: Path | None = None,
+        runtime_dir: Path | None = None,
+        clock_ms=None,
+    ):
+        self.config_file = Path(config_file or CONFIG_FILE)
+        self.runtime_dir = Path(runtime_dir) if runtime_dir else _trusted_runtime_dir()
+        self.clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
+        self._lock = threading.Lock()
+        self._last_command_ms = 0
+
+    @property
+    def command_file(self) -> Path:
+        return self.runtime_dir / COMMAND_FILE_NAME
+
+    def load_config(self) -> dict:
+        try:
+            raw = json.loads(self.config_file.read_text(encoding="utf-8"))
+            return _validate_config(raw)
+        except (OSError, json.JSONDecodeError, PatchControlError):
+            return dict(DEFAULT_CONFIG)
+
+    def _save_config(self, config: dict) -> None:
+        clean = _validate_config(config)
+        _atomic_write(
+            self.config_file,
+            json.dumps(clean, indent=2, sort_keys=True) + "\n",
+        )
+
+    def update_settings(self, changes: object) -> dict:
+        if not isinstance(changes, dict):
+            raise PatchControlError("Settings payload must be an object")
+        unknown = set(changes) - set(PUBLIC_TO_DISK)
+        if unknown:
+            raise PatchControlError(f"Unknown Patch setting: {sorted(unknown)[0]}")
+        with self._lock:
+            config = self.load_config()
+            for public, value in changes.items():
+                disk = PUBLIC_TO_DISK[public]
+                if public in {
+                    "roamEnabled",
+                    "microIdles",
+                    "activityReactions",
+                    "thermalReactions",
+                }:
+                    if type(value) is not bool:
+                        raise PatchControlError(f"{public} must be a boolean")
+                elif public == "pattern" and value not in PATTERNS:
+                    raise PatchControlError("pattern must be full, horizontal, or vertical")
+                elif public == "pace" and value not in PACES:
+                    raise PatchControlError("pace must be slow, normal, or quick")
+                config[disk] = value
+            self._save_config(config)
+        return self.snapshot()
+
+    def _next_command_ms(self) -> int:
+        now = int(self.clock_ms())
+        self._last_command_ms = max(now, self._last_command_ms + 1)
+        return self._last_command_ms
+
+    def send_command(self, payload: object) -> dict:
+        if not isinstance(payload, dict):
+            raise PatchControlError("Command payload must be an object")
+        command = payload.get("command")
+        if command not in {"auto", "home", "move", "preview"}:
+            raise PatchControlError("command must be auto, home, move, or preview")
+        expected = {
+            "auto": {"command"},
+            "home": {"command"},
+            "move": {"command", "location"},
+            "preview": {"command", "event"},
+        }[command]
+        if set(payload) != expected:
+            raise PatchControlError("Command payload has missing or unknown fields")
+
+        argument = "-"
+        if command == "move":
+            argument = payload.get("location")
+            if argument not in MOVE_LOCATIONS:
+                raise PatchControlError("Unknown physical Patch location")
+        elif command == "preview":
+            argument = payload.get("event")
+            if argument not in PREVIEW_EVENTS:
+                raise PatchControlError("Preview must be tool, read, attention, or success")
+
+        with self._lock:
+            config = self.load_config()
+            if command == "auto":
+                config["mode"] = "auto"
+                self._save_config(config)
+            elif command in {"home", "move"}:
+                config["mode"] = "manual"
+                self._save_config(config)
+            created_ms = self._next_command_ms()
+            _atomic_write(
+                self.command_file,
+                f"v1 {created_ms} {command} {argument}\n",
+            )
+        return self.snapshot()
+
+    def _control_status(self) -> tuple[str, str] | None:
+        path = self.runtime_dir / CONTROL_STATUS_FILE_NAME
+        try:
+            metadata = os.lstat(path)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_size > 128
+            ):
+                return None
+            fields = path.read_text(encoding="ascii").split()
+        except (OSError, UnicodeError):
+            return None
+        if (
+            len(fields) == 3
+            and fields[0] == "v1"
+            and fields[1] in {"auto", "manual"}
+            and fields[2] in LOCATIONS
+        ):
+            return fields[1], fields[2]
+        return None
+
+    def _state(self) -> str:
+        try:
+            state = (self.runtime_dir / STATE_FILE_NAME).read_text(
+                encoding="ascii"
+            ).strip()
+        except (OSError, UnicodeError):
+            return "unknown"
+        return state if state in KNOWN_STATES else "unknown"
+
+    def _fallback_location(self) -> str:
+        try:
+            fields = (self.runtime_dir / POSITION_FILE_NAME).read_text(
+                encoding="ascii"
+            ).split()
+            if len(fields) != 5 or fields[0] != "v1":
+                return "unknown"
+            point = (int(round(float(fields[2]))), int(round(float(fields[3]))))
+        except (OSError, UnicodeError, ValueError):
+            return "unknown"
+        if (point[0] - HOME_POINT[0]) ** 2 + (point[1] - HOME_POINT[1]) ** 2 <= 100**2:
+            return "home"
+        return min(
+            LOGICAL_LOCATIONS,
+            key=lambda location: (
+                point[0] - LOGICAL_LOCATIONS[location][0]
+            ) ** 2
+            + (point[1] - LOGICAL_LOCATIONS[location][1]) ** 2,
+        )
+
+    def _watcher_service(self) -> dict:
+        lock_path = self.runtime_dir / WATCHER_LOCK_FILE_NAME
+        try:
+            pid = int(lock_path.read_text(encoding="ascii").strip())
+            comm = Path(f"/proc/{pid}/comm").read_text(encoding="ascii").strip()
+            active = comm.startswith("lianli-agent-w")
+        except (OSError, UnicodeError, ValueError):
+            active = False
+        return {
+            "active": active,
+            "status": "running" if active else "offline",
+        }
+
+    def snapshot(self) -> dict:
+        config = self.load_config()
+        status = self._control_status()
+        mode, location = status or (config["mode"], self._fallback_location())
+        return {
+            "mode": mode,
+            "state": self._state(),
+            "location": location,
+            "service": self._watcher_service(),
+            "settings": _public_settings(config),
+        }

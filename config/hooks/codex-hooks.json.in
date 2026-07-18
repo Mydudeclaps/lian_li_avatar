@@ -1,0 +1,62 @@
+{
+  "description": "Drive Patch's Lian Li OLED animations from safe Codex lifecycle events.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/timeout --signal=KILL 0.4s @EVENT_BIN@ codex start </dev/null >/dev/null 2>&1",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^(Read|read_mcp_resource|list_mcp_resources|list_mcp_resource_templates|view_image|mcp__.*__(get|list|read|search|find|fetch|open|view).*)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/timeout --signal=KILL 0.4s @EVENT_BIN@ codex read </dev/null >/dev/null 2>&1",
+            "timeout": 1
+          }
+        ]
+      },
+      {
+        "matcher": "^(Bash|apply_patch|Edit|Write|Agent|spawn_agent|update_plan|mcp__.*__(create|update|delete|send|execute|set|add|remove|move|archive|close|merge|comment|reply|post|trigger).*)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/timeout --signal=KILL 0.4s @EVENT_BIN@ codex tool </dev/null >/dev/null 2>&1",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/timeout --signal=KILL 0.4s @EVENT_BIN@ codex permission </dev/null >/dev/null 2>&1",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/timeout --signal=KILL 0.4s @EVENT_BIN@ codex exit </dev/null >/dev/null 2>&1",
+            "timeout": 1
+          }
+        ]
+      }
+    ]
+  }
+}

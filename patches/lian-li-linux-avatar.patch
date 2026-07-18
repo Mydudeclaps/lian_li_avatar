@@ -1,0 +1,1546 @@
+diff --git c/crates/lianli-gui/src/editor/mapping/to_template.rs w/crates/lianli-gui/src/editor/mapping/to_template.rs
+index a1ab77e..5ac81ca 100644
+--- c/crates/lianli-gui/src/editor/mapping/to_template.rs
++++ w/crates/lianli-gui/src/editor/mapping/to_template.rs
+@@ -98,6 +98,7 @@ pub(in crate::editor) fn make_default_widget(id: &str, kind_str: &str, cx: f32,
+             loop_playback: true,
+             opacity: 1.0,
+             fit: ImageFit::Stretch,
++            selector: None,
+         },
+         "sparkline" => WidgetKind::Sparkline {
+             source: SensorSourceConfig::Constant { value: 0.0 },
+diff --git c/crates/lianli-media/src/custom.rs w/crates/lianli-media/src/custom.rs
+index 2210fdb..a3a3927 100644
+--- c/crates/lianli-media/src/custom.rs
++++ w/crates/lianli-media/src/custom.rs
+@@ -10,7 +10,7 @@ mod widgets;
+ 
+ use crate::common::{encode_jpeg_rgba, render_dimensions, MediaError};
+ use crate::sensor::FrameInfo;
+-use crate::video::decode_frames_to_rgba;
++use crate::video::{decode_frames_to_rgba, encode_rgba_frames_to_png};
+ use ab_glyph::FontVec;
+ use helpers::{
+     fast_overlay, fit_image, format_sensor_readout, load_font_from_disk, resolve_sensor_source,
+@@ -27,12 +27,12 @@ use lianli_shared::systeminfo::SysSensor;
+ use lianli_shared::template::{LcdTemplate, TemplateBackground, WidgetKind};
+ use parking_lot::Mutex;
+ use std::collections::HashMap;
+-use std::path::PathBuf;
++use std::path::{Path, PathBuf};
+ use std::sync::atomic::{AtomicUsize, Ordering};
+ use std::sync::Arc;
+ use std::time::{Duration, Instant};
+ use tracing::warn;
+-use widgets::{draw_widget, WidgetState};
++use widgets::{draw_widget, VideoClip, VideoTransition, WidgetState};
+ 
+ fn default_sample_interval(kind: &WidgetKind, explicit_ms: Option<u64>) -> Duration {
+     let default_ms = match kind {
+@@ -47,6 +47,194 @@ fn default_sample_interval(kind: &WidgetKind, explicit_ms: Option<u64>) -> Durat
+     Duration::from_millis(explicit_ms.unwrap_or(default_ms).max(min_ms))
+ }
+ 
++fn decode_video_clip(
++    path: &Path,
++    requested_fps: Option<f32>,
++    width: u32,
++    height: u32,
++    encode_alpha_frames: bool,
++) -> Result<VideoClip, MediaError> {
++    let decode_fps = crate::video::cap_fps_to_source(path, requested_fps.unwrap_or(30.0));
++    let ext = path
++        .extension()
++        .and_then(|e| e.to_str())
++        .map(|s| s.to_ascii_lowercase())
++        .unwrap_or_default();
++    let (frames, frames_png, frames_jpeg, durations) =
++        if ext == "gif" || ext == "png" || ext == "apng" {
++            let (frames, durations) =
++                decode_frames_to_rgba(path, decode_fps, width.max(1), height.max(1))?;
++            if encode_alpha_frames {
++                (
++                    None,
++                    Some(Arc::new(encode_rgba_frames_to_png(frames)?)),
++                    None,
++                    durations,
++                )
++            } else {
++                (Some(Arc::new(frames)), None, None, durations)
++            }
++        } else {
++            let (frames, durations) =
++                crate::video::decode_frames_to_jpeg(path, decode_fps, width.max(1), height.max(1))?;
++            (None, None, Some(Arc::new(frames)), durations)
++        };
++    let total_ms = durations
++        .iter()
++        .map(|d| d.as_millis() as u64)
++        .sum::<u64>()
++        .max(1);
++    Ok(VideoClip {
++        frames,
++        frames_png,
++        frames_jpeg,
++        frame_durations: Arc::new(durations),
++        total_ms,
++        fps_cap_ms: requested_fps.map(|_| (1000.0 / decode_fps.max(1.0)).round() as u64),
++    })
++}
++
++#[derive(Clone, Copy, Debug, PartialEq)]
++struct VideoPositionCommand {
++    seq: u64,
++    center: [f32; 2],
++    duration_ms: u64,
++}
++
++fn parse_video_position_command(value: &str) -> Option<VideoPositionCommand> {
++    let mut fields = value.split_ascii_whitespace();
++    if fields.next()? != "v1" {
++        return None;
++    }
++    let seq = fields.next()?.parse().ok()?;
++    let center_x: f32 = fields.next()?.parse().ok()?;
++    let center_y: f32 = fields.next()?.parse().ok()?;
++    let duration_ms = fields.next()?.parse().ok()?;
++    if fields.next().is_some() || !center_x.is_finite() || !center_y.is_finite() {
++        return None;
++    }
++    Some(VideoPositionCommand {
++        seq,
++        center: [center_x, center_y],
++        duration_ms,
++    })
++}
++
++fn clamp_video_position(center: [f32; 2], template: &LcdTemplate) -> [f32; 2] {
++    fn clamp_axis(value: f32, canvas_extent: u32) -> f32 {
++        if canvas_extent == 0 {
++            return value;
++        }
++        value.clamp(0.0, canvas_extent as f32)
++    }
++
++    [
++        clamp_axis(center[0], template.base_width),
++        clamp_axis(center[1], template.base_height),
++    ]
++}
++
++fn position_pixel(center: [f32; 2], uniform_scale: f32) -> [i32; 2] {
++    [
++        (center[0] * uniform_scale).round() as i32,
++        (center[1] * uniform_scale).round() as i32,
++    ]
++}
++
++fn advance_video_position(state: &mut WidgetState, elapsed_ms: u64, uniform_scale: f32) -> bool {
++    let previous_pixel = position_pixel(state.video_position_current, uniform_scale);
++    let linear = if state.video_position_duration_ms == 0 {
++        1.0
++    } else {
++        elapsed_ms
++            .saturating_sub(state.video_position_epoch_ms)
++            .min(state.video_position_duration_ms) as f64
++            / state.video_position_duration_ms as f64
++    };
++    let smooth = linear * linear * (3.0 - 2.0 * linear);
++    for axis in 0..2 {
++        state.video_position_current[axis] = state.video_position_from[axis]
++            + (state.video_position_to[axis] - state.video_position_from[axis]) * smooth as f32;
++    }
++    position_pixel(state.video_position_current, uniform_scale) != previous_pixel
++}
++
++fn apply_video_position_command(
++    state: &mut WidgetState,
++    command: VideoPositionCommand,
++    target: [f32; 2],
++    elapsed_ms: u64,
++    uniform_scale: f32,
++) -> bool {
++    if state.video_position_seq == Some(command.seq) {
++        return false;
++    }
++
++    let previous_pixel = position_pixel(state.video_position_current, uniform_scale);
++    state.video_position_from = state.video_position_current;
++    state.video_position_to = target;
++    state.video_position_seq = Some(command.seq);
++    state.video_position_epoch_ms = elapsed_ms;
++    state.video_position_duration_ms = command.duration_ms;
++    if command.duration_ms == 0 {
++        state.video_position_current = target;
++    }
++    position_pixel(state.video_position_current, uniform_scale) != previous_pixel
++}
++
++fn activate_video_variant(
++    state: &mut WidgetState,
++    selected: Option<String>,
++    elapsed_ms: u64,
++    crossfade_ms: u64,
++) {
++    let previous_render = state.cached_render.take();
++    state.active_video_variant = selected;
++    state.video_clip_epoch_ms = elapsed_ms;
++    state.last_video_frame_idx = None;
++    state.last_video_render_ms = None;
++    state.video_frame_cache = None;
++    state.cached_render_key = None;
++    state.video_transition = if crossfade_ms == 0 {
++        None
++    } else {
++        previous_render.map(|from_overlay| VideoTransition {
++            from_overlay,
++            started_ms: elapsed_ms,
++            duration_ms: crossfade_ms,
++            mix: 0,
++        })
++    };
++}
++
++fn transition_mix(started_ms: u64, duration_ms: u64, elapsed_ms: u64) -> Option<u8> {
++    let transition_elapsed = elapsed_ms.saturating_sub(started_ms);
++    if duration_ms == 0 || transition_elapsed >= duration_ms {
++        return None;
++    }
++    let numerator = transition_elapsed as u128 * u8::MAX as u128;
++    Some((numerator / duration_ms as u128) as u8)
++}
++
++fn advance_video_transition(state: &mut WidgetState, elapsed_ms: u64) -> bool {
++    let Some(transition) = state.video_transition.as_mut() else {
++        return false;
++    };
++    match transition_mix(transition.started_ms, transition.duration_ms, elapsed_ms) {
++        Some(mix) if mix != transition.mix => {
++            transition.mix = mix;
++            true
++        }
++        Some(_) => false,
++        None => {
++            state.video_transition = None;
++            state.cached_render = None;
++            state.cached_render_key = None;
++            true
++        }
++    }
++}
++
+ pub struct CustomAsset {
+     template: LcdTemplate,
+     widget_states: Mutex<Vec<WidgetState>>,
+@@ -183,22 +371,23 @@ impl CustomAsset {
+                 }
+             }
+ 
+-            if let WidgetKind::Video { path, .. } = &widget.kind {
++            if let WidgetKind::Video { path, selector, .. } = &widget.kind {
+                 let (ww, wh) = widget_size_px(widget, uniform_scale);
+-                let decode_fps = crate::video::cap_fps_to_source(path, widget.fps.unwrap_or(30.0));
+-                match decode_frames_to_rgba(path, decode_fps, ww.max(1), wh.max(1)) {
+-                    Ok((frames, durations)) => {
+-                        let total_ms: u64 = durations
+-                            .iter()
+-                            .map(|d| d.as_millis() as u64)
+-                            .sum::<u64>()
+-                            .max(1);
+-                        state.video_total_ms = total_ms;
+-                        state.video_frame_durations = Some(Arc::new(durations));
+-                        state.video_frames = Some(Arc::new(frames));
+-                        state.video_fps_cap_ms = widget
+-                            .fps
+-                            .map(|_| (1000.0 / decode_fps.max(1.0)).round() as u64);
++                state.video_position_from = [widget.x, widget.y];
++                state.video_position_to = [widget.x, widget.y];
++                state.video_position_current = [widget.x, widget.y];
++                let mut decoded_base_clip = None;
++                match decode_video_clip(path, widget.fps, ww, wh, selector.is_some()) {
++                    Ok(clip) => {
++                        if selector.is_some() {
++                            decoded_base_clip = Some(clip.clone());
++                        }
++                        state.video_frames = clip.frames;
++                        state.video_frames_png = clip.frames_png;
++                        state.video_frames_jpeg = clip.frames_jpeg;
++                        state.video_frame_durations = Some(clip.frame_durations);
++                        state.video_total_ms = clip.total_ms;
++                        state.video_fps_cap_ms = clip.fps_cap_ms;
+                     }
+                     Err(e) => warn!(
+                         "template '{}' widget '{}' video '{}' decode failed: {e}",
+@@ -207,6 +396,35 @@ impl CustomAsset {
+                         path.display()
+                     ),
+                 }
++                if let Some(selector) = selector {
++                    // State names such as codex-enter/claude-enter and the
++                    // three wait states intentionally share clips. Decode a
++                    // repeated path once and clone only the Arc-backed clip
++                    // metadata instead of duplicating encoded frame stores.
++                    let mut decoded_variants: HashMap<PathBuf, VideoClip> = HashMap::new();
++                    if let Some(base_clip) = decoded_base_clip {
++                        decoded_variants.insert(path.clone(), base_clip);
++                    }
++                    for (name, variant_path) in &selector.variants {
++                        if let Some(clip) = decoded_variants.get(variant_path).cloned() {
++                            state.video_variants.insert(name.clone(), clip);
++                            continue;
++                        }
++                        match decode_video_clip(variant_path, widget.fps, ww, wh, true) {
++                            Ok(clip) => {
++                                decoded_variants.insert(variant_path.clone(), clip.clone());
++                                state.video_variants.insert(name.clone(), clip);
++                            }
++                            Err(e) => warn!(
++                                "template '{}' widget '{}' video variant '{}' ('{}') decode failed: {e}",
++                                template.id,
++                                widget.id,
++                                name,
++                                variant_path.display()
++                            ),
++                        }
++                    }
++                }
+             }
+ 
+             widget_states.push(state);
+@@ -404,30 +622,103 @@ impl CustomAsset {
+                         any_dynamic_changed = true;
+                     }
+                 }
+-                WidgetKind::Video { .. } => {
+-                    if let (Some(frames), Some(durs)) =
+-                        (&state.video_frames, &state.video_frame_durations)
+-                    {
+-                        if !frames.is_empty() && state.video_total_ms > 0 {
+-                            let cycle = elapsed_ms % state.video_total_ms;
++                WidgetKind::Video {
++                    loop_playback,
++                    selector,
++                    ..
++                } => {
++                    if advance_video_position(state, elapsed_ms, self.uniform_scale) {
++                        any_dynamic_changed = true;
++                    }
++
++                    if let Some(selector) = selector {
++                        let poll_interval =
++                            Duration::from_millis(selector.poll_interval_ms.max(100));
++                        let poll_due = state
++                            .video_selector_last_poll
++                            .map(|last| now.saturating_duration_since(last) >= poll_interval)
++                            .unwrap_or(true);
++                        if poll_due {
++                            let selected = std::fs::read_to_string(&selector.state_file)
++                                .ok()
++                                .map(|value| value.trim().to_string())
++                                .filter(|value| state.video_variants.contains_key(value));
++                            state.video_selector_last_poll = Some(now);
++                            if selected != state.active_video_variant {
++                                activate_video_variant(
++                                    state,
++                                    selected,
++                                    elapsed_ms,
++                                    selector.crossfade_ms,
++                                );
++                                any_dynamic_changed = true;
++                            }
++
++                            if let Some(position_file) = &selector.position_file {
++                                if let Some(command) = std::fs::read_to_string(position_file)
++                                    .ok()
++                                    .and_then(|value| parse_video_position_command(&value))
++                                {
++                                    let target =
++                                        clamp_video_position(command.center, &self.template);
++                                    if apply_video_position_command(
++                                        state,
++                                        command,
++                                        target,
++                                        elapsed_ms,
++                                        self.uniform_scale,
++                                    ) {
++                                        any_dynamic_changed = true;
++                                    }
++                                }
++                            }
++                        }
++                    }
++
++                    if advance_video_transition(state, elapsed_ms) {
++                        any_dynamic_changed = true;
++                    }
++
++                    let clip = state
++                        .active_video_variant
++                        .as_ref()
++                        .and_then(|key| state.video_variants.get(key))
++                        .map(|clip| (clip.frame_durations.clone(), clip.total_ms, clip.fps_cap_ms))
++                        .or_else(|| {
++                            state.video_frame_durations.as_ref().map(|durations| {
++                                (
++                                    durations.clone(),
++                                    state.video_total_ms,
++                                    state.video_fps_cap_ms,
++                                )
++                            })
++                        });
++                    if let Some((durations, total_ms, fps_cap_ms)) = clip {
++                        if !durations.is_empty() && total_ms > 0 {
++                            let clip_elapsed = elapsed_ms.saturating_sub(state.video_clip_epoch_ms);
++                            let cycle = if *loop_playback {
++                                clip_elapsed % total_ms
++                            } else {
++                                clip_elapsed.min(total_ms.saturating_sub(1))
++                            };
+                             let mut acc = 0u64;
+-                            let mut idx = frames.len() - 1;
+-                            for (i, d) in durs.iter().enumerate() {
+-                                acc += (d.as_millis() as u64).max(1);
++                            let mut idx = durations.len() - 1;
++                            for (i, duration) in durations.iter().enumerate() {
++                                acc += (duration.as_millis() as u64).max(1);
+                                 if cycle < acc {
+                                     idx = i;
+                                     break;
+                                 }
+                             }
+-                            let cap_ok = match (state.video_fps_cap_ms, state.last_video_render_ms)
+-                            {
+-                                (Some(cap), Some(prev)) => elapsed_ms.saturating_sub(prev) >= cap,
++                            let cap_ok = match (fps_cap_ms, state.last_video_render_ms) {
++                                (Some(cap), Some(previous)) => {
++                                    elapsed_ms.saturating_sub(previous) >= cap
++                                }
+                                 _ => true,
+                             };
+                             if state.last_video_frame_idx != Some(idx) && cap_ok {
+                                 state.last_video_frame_idx = Some(idx);
+                                 state.last_video_render_ms = Some(elapsed_ms);
+-                                state.last_sample_at = Some(now);
+                                 any_dynamic_changed = true;
+                             }
+                         }
+@@ -468,3 +759,385 @@ impl CustomAsset {
+         Ok(Some(result))
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use lianli_shared::template::{ImageFit, TemplateBackground, VideoSelector, Widget};
++    use std::collections::BTreeMap;
++    use tempfile::tempdir;
++
++    fn template() -> LcdTemplate {
++        LcdTemplate {
++            id: "test".into(),
++            name: "Test".into(),
++            base_width: 2288,
++            base_height: 1048,
++            background: TemplateBackground::default(),
++            widgets: Vec::new(),
++            rotated: false,
++            target_device: None,
++        }
++    }
++
++    #[test]
++    fn parses_versioned_position_command_strictly() {
++        assert_eq!(
++            parse_video_position_command("v1 42 1200.5 700 900\n"),
++            Some(VideoPositionCommand {
++                seq: 42,
++                center: [1200.5, 700.0],
++                duration_ms: 900,
++            })
++        );
++        for invalid in [
++            "",
++            "v2 42 1200 700 900",
++            "v1 nope 1200 700 900",
++            "v1 42 NaN 700 900",
++            "v1 42 1200 inf 900",
++            "v1 42 1200 700",
++            "v1 42 1200 700 900 extra",
++        ] {
++            assert_eq!(parse_video_position_command(invalid), None, "{invalid}");
++        }
++    }
++
++    #[test]
++    fn position_center_uses_full_logical_canvas() {
++        let template = template();
++        assert_eq!(
++            clamp_video_position([-100.0, 5000.0], &template),
++            [0.0, 1048.0]
++        );
++        assert_eq!(
++            clamp_video_position([180.0, 720.0], &template),
++            [180.0, 720.0]
++        );
++        assert_eq!(
++            clamp_video_position([2108.0, 720.0], &template),
++            [2108.0, 720.0]
++        );
++    }
++
++    #[test]
++    fn interrupted_position_motion_continues_from_current_point() {
++        let mut state = WidgetState::blank();
++        state.video_position_from = [100.0, 100.0];
++        state.video_position_to = [100.0, 100.0];
++        state.video_position_current = [100.0, 100.0];
++
++        let first = VideoPositionCommand {
++            seq: 1,
++            center: [300.0, 100.0],
++            duration_ms: 1000,
++        };
++        assert!(!apply_video_position_command(
++            &mut state,
++            first,
++            first.center,
++            0,
++            1.0
++        ));
++        assert!(advance_video_position(&mut state, 500, 1.0));
++        assert_eq!(state.video_position_current, [200.0, 100.0]);
++
++        let second = VideoPositionCommand {
++            seq: 2,
++            center: [400.0, 100.0],
++            duration_ms: 1000,
++        };
++        assert!(!apply_video_position_command(
++            &mut state,
++            second,
++            second.center,
++            500,
++            1.0
++        ));
++        assert_eq!(state.video_position_from, [200.0, 100.0]);
++        assert!(advance_video_position(&mut state, 1000, 1.0));
++        assert_eq!(state.video_position_current, [300.0, 100.0]);
++
++        assert!(!apply_video_position_command(
++            &mut state,
++            second,
++            second.center,
++            1000,
++            1.0
++        ));
++    }
++
++    #[test]
++    fn selector_change_snapshots_render_and_completes_crossfade() {
++        let outgoing = RgbaImage::from_pixel(2, 1, Rgba([20, 40, 60, 200]));
++        let mut state = WidgetState::blank();
++        state.cached_render = Some(outgoing.clone());
++        state.cached_render_key = Some(7);
++        state.video_frame_cache = Some(("old".into(), 3, RgbaImage::new(2, 1)));
++
++        activate_video_variant(&mut state, Some("new".into()), 100, 250);
++
++        assert_eq!(state.active_video_variant.as_deref(), Some("new"));
++        assert!(state.cached_render.is_none());
++        assert!(state.cached_render_key.is_none());
++        assert!(state.video_frame_cache.is_none());
++        let transition = state.video_transition.as_ref().expect("transition");
++        assert_eq!(transition.from_overlay, outgoing);
++        assert_eq!(transition.mix, 0);
++
++        assert!(advance_video_transition(&mut state, 225));
++        assert_eq!(
++            state.video_transition.as_ref().map(|fade| fade.mix),
++            Some(127)
++        );
++        assert!(advance_video_transition(&mut state, 350));
++        assert!(state.video_transition.is_none());
++    }
++
++    #[test]
++    fn transition_progress_is_overflow_safe() {
++        assert_eq!(transition_mix(0, 250, 0), Some(0));
++        assert_eq!(transition_mix(0, 250, 125), Some(127));
++        assert_eq!(transition_mix(0, 250, 250), None);
++        assert_eq!(transition_mix(0, u64::MAX, u64::MAX - 1), Some(254));
++    }
++
++    #[test]
++    fn selector_alpha_clips_use_lossless_encoded_store() {
++        let frame = RgbaImage::from_pixel(2, 1, Rgba([10, 20, 30, 128]));
++        let png = encode_rgba_frames_to_png(vec![frame]).expect("encode source");
++        let temp = tempdir().expect("temporary directory");
++        let path = temp.path().join("selector.png");
++        std::fs::write(&path, &png[0]).expect("write source");
++
++        let selector_clip =
++            decode_video_clip(&path, Some(10.0), 2, 1, true).expect("selector clip");
++        assert!(selector_clip.frames.is_none());
++        assert!(selector_clip.frames_png.is_some());
++        assert!(selector_clip.frames_jpeg.is_none());
++
++        let legacy_clip = decode_video_clip(&path, Some(10.0), 2, 1, false).expect("legacy clip");
++        assert!(legacy_clip.frames.is_some());
++        assert!(legacy_clip.frames_png.is_none());
++        assert!(legacy_clip.frames_jpeg.is_none());
++    }
++
++    #[test]
++    fn same_path_base_variant_keeps_later_widgets_visible() {
++        let temp = tempdir().expect("temporary directory");
++        let state_file = temp.path().join("state");
++        std::fs::write(&state_file, "idle\n").expect("write selector state");
++
++        let animation = PathBuf::from(concat!(
++            env!("CARGO_MANIFEST_DIR"),
++            "/../../templates/assets/neon-us88/animation.apng"
++        ));
++        let mut variants = BTreeMap::new();
++        variants.insert("idle".into(), animation.clone());
++
++        let panel_path = temp.path().join("panel.png");
++        let panel = RgbaImage::from_pixel(400, 200, Rgba([0, 255, 0, 255]));
++        let encoded = encode_rgba_frames_to_png(vec![panel]).expect("encode panel");
++        std::fs::write(&panel_path, &encoded[0]).expect("write panel");
++
++        let template = LcdTemplate {
++            id: "same-path".into(),
++            name: "Same path".into(),
++            base_width: 400,
++            base_height: 200,
++            background: TemplateBackground::default(),
++            widgets: vec![
++                Widget {
++                    id: "mascot".into(),
++                    kind: WidgetKind::Video {
++                        path: animation,
++                        loop_playback: true,
++                        opacity: 1.0,
++                        fit: ImageFit::Stretch,
++                        selector: Some(VideoSelector {
++                            state_file,
++                            position_file: None,
++                            poll_interval_ms: 100,
++                            crossfade_ms: 0,
++                            variants,
++                        }),
++                    },
++                    x: 100.0,
++                    y: 100.0,
++                    width: 200.0,
++                    height: 200.0,
++                    rotation: 0.0,
++                    visible: true,
++                    update_interval_ms: None,
++                    fps: Some(10.0),
++                    sensor_category: None,
++                },
++                Widget {
++                    id: "panel".into(),
++                    kind: WidgetKind::Image {
++                        path: panel_path,
++                        opacity: 1.0,
++                        fit: ImageFit::Stretch,
++                    },
++                    x: 300.0,
++                    y: 100.0,
++                    width: 200.0,
++                    height: 200.0,
++                    rotation: 0.0,
++                    visible: true,
++                    update_interval_ms: None,
++                    fps: None,
++                    sensor_category: None,
++                },
++            ],
++            rotated: false,
++            target_device: None,
++        };
++        let screen = ScreenInfo {
++            width: 400,
++            height: 200,
++            max_fps: 30,
++            jpeg_quality: 100,
++            max_payload: usize::MAX,
++            h264: false,
++            needs_keepalive: false,
++        };
++        let asset = CustomAsset::new(&template, 0.0, &screen, &[], false).expect("build asset");
++        {
++            let states = asset.widget_states.lock();
++            let state = &states[0];
++            let base = state.video_frames_png.as_ref().expect("base PNG store");
++            let idle = state
++                .video_variants
++                .get("idle")
++                .and_then(|clip| clip.frames_png.as_ref())
++                .expect("idle PNG store");
++            assert!(Arc::ptr_eq(base, idle));
++        }
++        let frame = asset
++            .render_frame(true)
++            .expect("render")
++            .expect("forced frame");
++        let frame = image::load_from_memory(&frame.data)
++            .expect("decode JPEG")
++            .to_rgba8();
++        let offset = (100 * 400 + 350) * 4;
++        let pixel = &frame.as_raw()[offset..offset + 4];
++        assert!(pixel[1] > 240, "{pixel:?}");
++        assert!(pixel[0] < 20, "{pixel:?}");
++        assert!(pixel[2] < 20, "{pixel:?}");
++    }
++
++    #[test]
++    fn position_commands_are_logical_before_output_orientation() {
++        fn render_marker(center: [f32; 2]) -> RgbaImage {
++            let temp = tempdir().expect("temporary directory");
++            let marker_path = temp.path().join("marker.png");
++            let marker = RgbaImage::from_pixel(1, 1, Rgba([255, 0, 0, 255]));
++            let encoded = encode_rgba_frames_to_png(vec![marker]).expect("encode marker");
++            std::fs::write(&marker_path, &encoded[0]).expect("write marker");
++
++            let state_file = temp.path().join("state");
++            let position_file = temp.path().join("position");
++            std::fs::write(
++                &position_file,
++                format!("v1 1 {} {} 0\n", center[0], center[1]),
++            )
++            .expect("write position");
++
++            let template = LcdTemplate {
++                id: "oriented-position".into(),
++                name: "Oriented position".into(),
++                base_width: 400,
++                base_height: 200,
++                background: TemplateBackground::default(),
++                widgets: vec![Widget {
++                    id: "marker".into(),
++                    kind: WidgetKind::Video {
++                        path: marker_path,
++                        loop_playback: true,
++                        opacity: 1.0,
++                        fit: ImageFit::Stretch,
++                        selector: Some(VideoSelector {
++                            state_file,
++                            position_file: Some(position_file),
++                            poll_interval_ms: 100,
++                            crossfade_ms: 0,
++                            variants: BTreeMap::new(),
++                        }),
++                    },
++                    x: 200.0,
++                    y: 100.0,
++                    width: 20.0,
++                    height: 20.0,
++                    rotation: 0.0,
++                    visible: true,
++                    update_interval_ms: None,
++                    fps: Some(10.0),
++                    sensor_category: None,
++                }],
++                rotated: false,
++                target_device: None,
++            };
++            let screen = ScreenInfo {
++                width: 200,
++                height: 400,
++                max_fps: 30,
++                jpeg_quality: 100,
++                max_payload: usize::MAX,
++                h264: false,
++                needs_keepalive: false,
++            };
++            let asset =
++                CustomAsset::new(&template, 90.0, &screen, &[], false).expect("build asset");
++            let frame = asset
++                .render_frame(true)
++                .expect("render")
++                .expect("forced frame");
++            image::load_from_memory(&frame.data)
++                .expect("decode oriented JPEG")
++                .to_rgba8()
++        }
++
++        fn red_centroid(image: &RgbaImage) -> (f32, f32) {
++            let mut total_x = 0u64;
++            let mut total_y = 0u64;
++            let mut count = 0u64;
++            for (x, y, pixel) in image.enumerate_pixels() {
++                if pixel[0] > 200 && pixel[1] < 50 && pixel[2] < 50 {
++                    total_x += u64::from(x);
++                    total_y += u64::from(y);
++                    count += 1;
++                }
++            }
++            assert!(count > 0, "red marker was not rendered");
++            (total_x as f32 / count as f32, total_y as f32 / count as f32)
++        }
++
++        let origin = render_marker([100.0, 50.0]);
++        let logical_x_move = render_marker([300.0, 50.0]);
++        let logical_y_move = render_marker([100.0, 150.0]);
++        assert_eq!(origin.dimensions(), (200, 400));
++
++        let origin = red_centroid(&origin);
++        let logical_x_move = red_centroid(&logical_x_move);
++        let logical_y_move = red_centroid(&logical_y_move);
++
++        assert!(
++            (logical_x_move.0 - origin.0).abs() < 1.0,
++            "{origin:?} -> {logical_x_move:?}"
++        );
++        assert!(
++            logical_x_move.1 > origin.1 + 190.0,
++            "{origin:?} -> {logical_x_move:?}"
++        );
++        assert!(
++            logical_y_move.0 < origin.0 - 90.0,
++            "{origin:?} -> {logical_y_move:?}"
++        );
++        assert!(
++            (logical_y_move.1 - origin.1).abs() < 1.0,
++            "{origin:?} -> {logical_y_move:?}"
++        );
++    }
++}
+diff --git c/crates/lianli-media/src/custom/helpers/drawing.rs w/crates/lianli-media/src/custom/helpers/drawing.rs
+index 97d2e9e..51400dd 100644
+--- c/crates/lianli-media/src/custom/helpers/drawing.rs
++++ w/crates/lianli-media/src/custom/helpers/drawing.rs
+@@ -329,6 +329,41 @@ pub fn fast_overlay(dst: &mut RgbaImage, src: &RgbaImage, tl_x: i64, tl_y: i64)
+     }
+ }
+ 
++/// Interpolate two straight-alpha RGBA overlays in premultiplied-alpha space.
++///
++/// Interpolating straight RGB values darkens antialiased edges when one side
++/// is transparent. Premultiplication keeps the visible color stable while the
++/// alpha changes.
++pub fn premultiplied_crossfade(from: &RgbaImage, to: &RgbaImage, mix: u8) -> RgbaImage {
++    if mix == 0 {
++        return from.clone();
++    }
++    if mix == u8::MAX || from.dimensions() != to.dimensions() {
++        return to.clone();
++    }
++
++    let t = mix as u32;
++    let inverse_t = 255 - t;
++    let mut output = RgbaImage::new(to.width(), to.height());
++    for ((out, from), to) in output.pixels_mut().zip(from.pixels()).zip(to.pixels()) {
++        let from_alpha = from[3] as u32;
++        let to_alpha = to[3] as u32;
++        let alpha_denominator = from_alpha * inverse_t + to_alpha * t;
++        if alpha_denominator == 0 {
++            *out = Rgba([0, 0, 0, 0]);
++            continue;
++        }
++
++        for channel in 0..3 {
++            let numerator =
++                from[channel] as u32 * from_alpha * inverse_t + to[channel] as u32 * to_alpha * t;
++            out[channel] = ((numerator + alpha_denominator / 2) / alpha_denominator) as u8;
++        }
++        out[3] = ((alpha_denominator + 127) / 255) as u8;
++    }
++    output
++}
++
+ pub fn blit_with_opacity(dst: &mut RgbaImage, src: &RgbaImage, opacity: f32) {
+     let o = opacity.clamp(0.0, 1.0);
+     if o <= 0.0 {
+@@ -353,3 +388,40 @@ pub fn blit_with_opacity(dst: &mut RgbaImage, src: &RgbaImage, opacity: f32) {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::premultiplied_crossfade;
++    use image::{Rgba, RgbaImage};
++
++    fn pixel(rgba: [u8; 4]) -> RgbaImage {
++        RgbaImage::from_pixel(1, 1, Rgba(rgba))
++    }
++
++    #[test]
++    fn crossfade_keeps_color_when_fading_from_transparent() {
++        let from = pixel([7, 11, 13, 0]);
++        let to = pixel([200, 100, 50, 255]);
++        let blended = premultiplied_crossfade(&from, &to, 128);
++
++        assert_eq!(blended.get_pixel(0, 0).0, [200, 100, 50, 128]);
++    }
++
++    #[test]
++    fn crossfade_blends_opaque_colors_without_losing_alpha() {
++        let from = pixel([255, 0, 0, 255]);
++        let to = pixel([0, 0, 255, 255]);
++        let blended = premultiplied_crossfade(&from, &to, 128);
++
++        assert_eq!(blended.get_pixel(0, 0).0, [127, 0, 128, 255]);
++    }
++
++    #[test]
++    fn crossfade_endpoints_are_exact() {
++        let from = pixel([7, 11, 13, 0]);
++        let to = pixel([1, 2, 3, 254]);
++
++        assert_eq!(premultiplied_crossfade(&from, &to, 0), from);
++        assert_eq!(premultiplied_crossfade(&from, &to, 255), to);
++    }
++}
+diff --git c/crates/lianli-media/src/custom/helpers/mod.rs w/crates/lianli-media/src/custom/helpers/mod.rs
+index 343be2f..6594558 100644
+--- c/crates/lianli-media/src/custom/helpers/mod.rs
++++ w/crates/lianli-media/src/custom/helpers/mod.rs
+@@ -7,7 +7,8 @@ mod text;
+ 
+ pub(super) use drawing::{
+     blit_with_opacity, draw_annulus, fast_overlay, fast_resize_rgba, fill_rect_clipped_rounded,
+-    fill_rounded_rect, fit_image, range_color, range_color_blended, unit_interval,
++    fill_rounded_rect, fit_image, premultiplied_crossfade, range_color, range_color_blended,
++    unit_interval,
+ };
+ pub(super) use fonts::{load_font_from_disk, resolve_font, widget_font_refs};
+ pub(super) use formatting::{format_sensor_readout, render_value_format};
+diff --git c/crates/lianli-media/src/custom/widgets/mod.rs w/crates/lianli-media/src/custom/widgets/mod.rs
+index a1f261b..b396a43 100644
+--- c/crates/lianli-media/src/custom/widgets/mod.rs
++++ w/crates/lianli-media/src/custom/widgets/mod.rs
+@@ -16,7 +16,9 @@ pub(super) mod speedometer;
+ pub(super) mod value_text;
+ pub(super) mod video_widget;
+ 
+-use super::helpers::{fast_overlay, fast_resize_rgba, resolve_font, widget_size_px};
++use super::helpers::{
++    fast_overlay, fast_resize_rgba, premultiplied_crossfade, resolve_font, widget_size_px,
++};
+ use ab_glyph::FontVec;
+ use fast_image_resize::FilterType as FirFilter;
+ use image::{Rgba, RgbaImage};
+@@ -29,13 +31,47 @@ use std::sync::atomic::AtomicBool;
+ use std::sync::Arc;
+ use std::time::{Duration, Instant};
+ 
++#[derive(Clone)]
++pub(super) struct VideoClip {
++    pub frames: Option<Arc<Vec<RgbaImage>>>,
++    pub frames_png: Option<Arc<Vec<Vec<u8>>>>,
++    pub frames_jpeg: Option<Arc<Vec<Vec<u8>>>>,
++    pub frame_durations: Arc<Vec<Duration>>,
++    pub total_ms: u64,
++    pub fps_cap_ms: Option<u64>,
++}
++
++pub(super) struct VideoTransition {
++    pub from_overlay: RgbaImage,
++    pub started_ms: u64,
++    pub duration_ms: u64,
++    pub mix: u8,
++}
++
+ pub(super) struct WidgetState {
+     pub resolved_sensor: Option<ResolvedSensor>,
+     pub loaded_image: Option<RgbaImage>,
+     pub video_frames: Option<Arc<Vec<RgbaImage>>>,
++    /// Lossless PNG frames for selector animations with transparency.
++    pub video_frames_png: Option<Arc<Vec<Vec<u8>>>>,
++    /// JPEG-compressed frames for large (full-canvas) videos; decoded on
++    /// demand into `video_frame_cache` so RAM stays at one frame.
++    pub video_frames_jpeg: Option<Arc<Vec<Vec<u8>>>>,
++    pub video_frame_cache: Option<(String, usize, RgbaImage)>,
+     pub video_frame_durations: Option<Arc<Vec<Duration>>>,
+     pub video_total_ms: u64,
+     pub video_fps_cap_ms: Option<u64>,
++    pub video_variants: HashMap<String, VideoClip>,
++    pub active_video_variant: Option<String>,
++    pub video_clip_epoch_ms: u64,
++    pub video_selector_last_poll: Option<Instant>,
++    pub video_transition: Option<VideoTransition>,
++    pub video_position_from: [f32; 2],
++    pub video_position_to: [f32; 2],
++    pub video_position_current: [f32; 2],
++    pub video_position_seq: Option<u64>,
++    pub video_position_epoch_ms: u64,
++    pub video_position_duration_ms: u64,
+     pub last_video_render_ms: Option<u64>,
+     pub last_render_text: Option<String>,
+     pub last_quantized: i32,
+@@ -57,9 +93,23 @@ impl WidgetState {
+             resolved_sensor: None,
+             loaded_image: None,
+             video_frames: None,
++            video_frames_png: None,
++            video_frames_jpeg: None,
++            video_frame_cache: None,
+             video_frame_durations: None,
+             video_total_ms: 0,
+             video_fps_cap_ms: None,
++            video_variants: HashMap::new(),
++            active_video_variant: None,
++            video_clip_epoch_ms: 0,
++            video_selector_last_poll: None,
++            video_transition: None,
++            video_position_from: [0.0, 0.0],
++            video_position_to: [0.0, 0.0],
++            video_position_current: [0.0, 0.0],
++            video_position_seq: None,
++            video_position_epoch_ms: 0,
++            video_position_duration_ms: 0,
+             last_video_render_ms: None,
+             last_render_text: None,
+             last_quantized: i32::MIN,
+@@ -95,7 +145,15 @@ fn render_key(kind: &WidgetKind, state: &WidgetState) -> u64 {
+             }
+         }
+         WidgetKind::CoreBars { .. } => state.cached_core_usage.hash(&mut h),
+-        WidgetKind::Video { .. } => state.last_video_frame_idx.hash(&mut h),
++        WidgetKind::Video { .. } => {
++            state.active_video_variant.hash(&mut h);
++            state.last_video_frame_idx.hash(&mut h);
++            state
++                .video_transition
++                .as_ref()
++                .map(|fade| fade.mix)
++                .hash(&mut h);
++        }
+         WidgetKind::ClockDigital { .. } | WidgetKind::ClockAnalog { .. } => {
+             state.last_clock_key.hash(&mut h)
+         }
+@@ -120,9 +178,18 @@ pub(super) fn draw_widget(
+         return;
+     }
+ 
++    let (center_x, center_y) = match &widget.kind {
++        WidgetKind::Video {
++            selector: Some(_), ..
++        } => (
++            state.video_position_current[0],
++            state.video_position_current[1],
++        ),
++        _ => (widget.x, widget.y),
++    };
+     let (ww_i, wh_i) = (ww as i32, wh as i32);
+-    let tl_x = offset_x + (widget.x * uniform_scale).round() as i32 - ww_i / 2;
+-    let tl_y = offset_y + (widget.y * uniform_scale).round() as i32 - wh_i / 2;
++    let tl_x = offset_x + (center_x * uniform_scale).round() as i32 - ww_i / 2;
++    let tl_y = offset_y + (center_y * uniform_scale).round() as i32 - wh_i / 2;
+ 
+     let key = render_key(&widget.kind, state);
+     if state.cached_render_key == Some(key) {
+@@ -486,7 +553,7 @@ pub(super) fn draw_widget(
+         sub
+     };
+ 
+-    let final_overlay = if widget.rotation.abs() > 0.5 {
++    let mut final_overlay = if widget.rotation.abs() > 0.5 {
+         rotate_about_center(
+             &sub,
+             widget.rotation.to_radians(),
+@@ -497,7 +564,48 @@ pub(super) fn draw_widget(
+         sub
+     };
+ 
++    if let Some(transition) = &state.video_transition {
++        final_overlay =
++            premultiplied_crossfade(&transition.from_overlay, &final_overlay, transition.mix);
++    }
++
+     fast_overlay(frame, &final_overlay, tl_x as i64, tl_y as i64);
+     state.cached_render = Some(final_overlay);
+     state.cached_render_key = Some(key);
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::{render_key, VideoTransition, WidgetState};
++    use image::RgbaImage;
++    use lianli_shared::template::{ImageFit, WidgetKind};
++    use std::path::PathBuf;
++
++    fn video_kind() -> WidgetKind {
++        WidgetKind::Video {
++            path: PathBuf::from("/tmp/video.png"),
++            loop_playback: true,
++            opacity: 1.0,
++            fit: ImageFit::Stretch,
++            selector: None,
++        }
++    }
++
++    #[test]
++    fn video_render_key_tracks_crossfade_but_not_position() {
++        let kind = video_kind();
++        let mut state = WidgetState::blank();
++        let initial = render_key(&kind, &state);
++
++        state.video_position_current = [123.0, 456.0];
++        assert_eq!(render_key(&kind, &state), initial);
++
++        state.video_transition = Some(VideoTransition {
++            from_overlay: RgbaImage::new(1, 1),
++            started_ms: 0,
++            duration_ms: 250,
++            mix: 128,
++        });
++        assert_ne!(render_key(&kind, &state), initial);
++    }
++}
+diff --git c/crates/lianli-media/src/custom/widgets/video_widget.rs w/crates/lianli-media/src/custom/widgets/video_widget.rs
+index 797c2dd..8699dfa 100644
+--- c/crates/lianli-media/src/custom/widgets/video_widget.rs
++++ w/crates/lianli-media/src/custom/widgets/video_widget.rs
+@@ -4,13 +4,55 @@ use super::super::helpers::blit_with_opacity;
+ use super::WidgetState;
+ use image::RgbaImage;
+ 
+-pub(in super::super) fn draw(sub: &mut RgbaImage, state: &WidgetState, opacity: f32) {
+-    if let Some(frames) = &state.video_frames {
++pub(in super::super) fn draw(sub: &mut RgbaImage, state: &mut WidgetState, opacity: f32) {
++    let idx = state.last_video_frame_idx.unwrap_or(0);
++    let clip_key = state.active_video_variant.clone().unwrap_or_default();
++    let (frames, pngs, jpegs) = state
++        .active_video_variant
++        .as_ref()
++        .and_then(|key| state.video_variants.get(key))
++        .map(|clip| {
++            (
++                clip.frames.clone(),
++                clip.frames_png.clone(),
++                clip.frames_jpeg.clone(),
++            )
++        })
++        .unwrap_or_else(|| {
++            (
++                state.video_frames.clone(),
++                state.video_frames_png.clone(),
++                state.video_frames_jpeg.clone(),
++            )
++        });
++
++    // Lossless PNG selector frames and JPEG video frames share one decoded
++    // frame cache. `load_from_memory` detects either format.
++    if let Some(encoded_frames) = pngs.or(jpegs) {
++        if encoded_frames.is_empty() {
++            return;
++        }
++        let idx = idx.min(encoded_frames.len() - 1);
++        let cached = matches!(
++            &state.video_frame_cache,
++            Some((key, i, _)) if key == &clip_key && *i == idx
++        );
++        if !cached {
++            match image::load_from_memory(&encoded_frames[idx]) {
++                Ok(img) => state.video_frame_cache = Some((clip_key.clone(), idx, img.to_rgba8())),
++                Err(_) => return,
++            }
++        }
++        if let Some((_, _, frame)) = &state.video_frame_cache {
++            blit_with_opacity(sub, frame, opacity);
++        }
++        return;
++    }
++
++    // Legacy raw-RGBA store (GIF/APNG and small videos).
++    if let Some(frames) = frames {
+         if !frames.is_empty() {
+-            let idx = state
+-                .last_video_frame_idx
+-                .unwrap_or(0)
+-                .min(frames.len() - 1);
++            let idx = idx.min(frames.len() - 1);
+             blit_with_opacity(sub, &frames[idx], opacity);
+         }
+     }
+diff --git c/crates/lianli-media/src/video/mod.rs w/crates/lianli-media/src/video/mod.rs
+index 64a9b40..e313804 100644
+--- c/crates/lianli-media/src/video/mod.rs
++++ w/crates/lianli-media/src/video/mod.rs
+@@ -9,12 +9,17 @@ pub use h264_live::LiveH264Encoder;
+ use crate::common::{apply_orientation, encode_jpeg, render_dimensions, MediaError};
+ use ffmpeg::{run_ffmpeg, run_ffmpeg_rgba};
+ use image::codecs::gif::GifDecoder;
+-use image::codecs::png::PngDecoder;
++use image::codecs::png::{
++    CompressionType as PngCompressionType, FilterType as PngFilterType, PngDecoder, PngEncoder,
++};
+ use image::imageops::FilterType;
+-use image::{load_from_memory, AnimationDecoder, DynamicImage, Frames, RgbaImage};
++use image::{
++    load_from_memory, AnimationDecoder, DynamicImage, ExtendedColorType, Frames, ImageEncoder,
++    RgbaImage,
++};
+ use lianli_shared::screen::ScreenInfo;
+ use std::fs::File;
+-use std::io::BufReader;
++use std::io::{BufReader, Cursor};
+ use std::path::Path;
+ use std::time::Duration;
+ use tempfile::TempDir;
+@@ -173,6 +178,83 @@ pub fn decode_frames_to_rgba(
+     Ok((frames, durations))
+ }
+ 
++/// Losslessly encode fully composited RGBA frames as independent PNG images.
++///
++/// Selector-backed animations keep these compressed bytes in memory and
++/// decode only the currently displayed frame. Independent PNGs preserve APNG
++/// alpha/blend/disposal results while avoiding a full-canvas RGBA allocation
++/// for every inactive variant.
++pub fn encode_rgba_frames_to_png(frames: Vec<RgbaImage>) -> Result<Vec<Vec<u8>>, MediaError> {
++    let mut encoded = Vec::with_capacity(frames.len());
++    for frame in frames {
++        let mut png = Vec::new();
++        PngEncoder::new_with_quality(&mut png, PngCompressionType::Fast, PngFilterType::Adaptive)
++            .write_image(
++            frame.as_raw(),
++            frame.width(),
++            frame.height(),
++            ExtendedColorType::Rgba8,
++        )?;
++        encoded.push(png);
++    }
++    Ok(encoded)
++}
++
++/// Decode a video into JPEG-compressed frames (peak RAM = one frame).
++///
++/// Used by full-canvas template video widgets where storing raw RGBA for
++/// every frame would cost gigabytes. GIF/APNG callers should use
++/// `decode_frames_to_rgba` (frames are small and may carry alpha).
++pub fn decode_frames_to_jpeg(
++    path: &Path,
++    fps: f32,
++    width: u32,
++    height: u32,
++) -> Result<(Vec<Vec<u8>>, Vec<Duration>), MediaError> {
++    let temp = TempDir::new()?;
++    let output_pattern = temp.path().join("frame_%05d.png");
++    run_ffmpeg_rgba(path, fps, &output_pattern, width, height)?;
++
++    let mut entries: Vec<_> = std::fs::read_dir(temp.path())?
++        .filter_map(|e| e.ok())
++        .map(|e| e.path())
++        .filter(|p| p.extension().map(|x| x == "png").unwrap_or(false))
++        .collect();
++    entries.sort();
++
++    if entries.is_empty() {
++        return Err(MediaError::EmptyVideo);
++    }
++
++    let mut frames = Vec::with_capacity(entries.len());
++    for frame_path in entries {
++        let data = std::fs::read(&frame_path)?;
++        // Skip individually corrupt frames (seen: tmpfs PNG CRC errors)
++        // rather than failing the whole clip.
++        let img = match load_from_memory(&data) {
++            Ok(img) => img.to_rgb8(),
++            Err(e) => {
++                tracing::warn!("skipping corrupt video frame {}: {e}", frame_path.display());
++                continue;
++            }
++        };
++        let mut jpeg = Vec::new();
++        let mut cursor = Cursor::new(&mut jpeg);
++        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, 85);
++        encoder.encode_image(&img).map_err(MediaError::Image)?;
++        drop(encoder);
++        drop(cursor);
++        frames.push(jpeg);
++    }
++    if frames.is_empty() {
++        return Err(MediaError::EmptyVideo);
++    }
++
++    let interval = Duration::from_secs_f32(1.0 / fps.max(1.0));
++    let durations = vec![interval; frames.len()];
++    Ok((frames, durations))
++}
++
+ fn decode_animation_frames(
+     frames: Frames<'_>,
+     width: u32,
+@@ -190,7 +272,14 @@ fn decode_animation_frames(
+         };
+         let duration = Duration::from_millis(millis.max(10.0) as u64);
+         let rgba = frame.into_buffer();
+-        let resized = image::imageops::resize(&rgba, width, height, FilterType::Lanczos3);
++        // Keep native-size transparent overlays byte-for-byte. Resampling
++        // straight-alpha RGBA can pull transparent-black RGB into the edge
++        // pixels and leave a faint dark halo around sprite art.
++        let resized = if rgba.width() == width && rgba.height() == height {
++            rgba
++        } else {
++            image::imageops::resize(&rgba, width, height, FilterType::Lanczos3)
++        };
+         out_frames.push(resized);
+         durations.push(duration);
+     }
+@@ -209,3 +298,55 @@ pub(super) fn target_dimensions(screen: &ScreenInfo, orientation: f32) -> (u32,
+         (rw, rh)
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::{decode_frames_to_rgba, encode_rgba_frames_to_png};
++    use image::{Rgba, RgbaImage};
++    use std::path::Path;
++
++    #[test]
++    fn lossless_png_frame_store_round_trips_rgba_exactly() {
++        let mut frame = RgbaImage::new(3, 2);
++        let pixels = [
++            Rgba([255, 0, 0, 255]),
++            Rgba([0, 255, 0, 128]),
++            Rgba([7, 11, 13, 0]),
++            Rgba([0, 0, 255, 64]),
++            Rgba([240, 200, 160, 1]),
++            Rgba([1, 2, 3, 254]),
++        ];
++        for (dst, src) in frame.pixels_mut().zip(pixels) {
++            *dst = src;
++        }
++
++        let encoded =
++            encode_rgba_frames_to_png(vec![frame.clone()]).expect("encode lossless frame");
++        assert_eq!(encoded.len(), 1);
++        let decoded = image::load_from_memory(&encoded[0])
++            .expect("decode stored frame")
++            .to_rgba8();
++        assert_eq!(decoded, frame);
++    }
++
++    #[test]
++    fn composited_apng_frames_round_trip_through_lossless_store() {
++        let path = Path::new(concat!(
++            env!("CARGO_MANIFEST_DIR"),
++            "/../../templates/assets/neon-us88/animation.apng"
++        ));
++        let (frames, durations) = decode_frames_to_rgba(path, 30.0, 200, 200).expect("decode APNG");
++        assert!(frames.len() > 1);
++        assert_eq!(frames.len(), durations.len());
++
++        let expected = frames.clone();
++        let encoded = encode_rgba_frames_to_png(frames).expect("encode APNG frames");
++        assert_eq!(encoded.len(), expected.len());
++        for (index, (png, expected)) in encoded.iter().zip(&expected).enumerate() {
++            let decoded = image::load_from_memory(png)
++                .unwrap_or_else(|error| panic!("decode stored frame {index}: {error}"))
++                .to_rgba8();
++            assert_eq!(&decoded, expected, "frame {index}");
++        }
++    }
++}
+diff --git c/crates/lianli-shared/src/template/mod.rs w/crates/lianli-shared/src/template/mod.rs
+index 9f78365..7151bc0 100644
+--- c/crates/lianli-shared/src/template/mod.rs
++++ w/crates/lianli-shared/src/template/mod.rs
+@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
+ use std::path::PathBuf;
+ 
+ pub mod widget_kind;
+-pub use widget_kind::{default_gradient_stops, GradientStop, WidgetKind};
++pub use widget_kind::{default_gradient_stops, GradientStop, VideoSelector, WidgetKind};
+ 
+ /// Accepts both `[r,g,b]` (alpha defaults to 255) and `[r,g,b,a]` so older
+ /// hand-written templates keep loading after the alpha channel was added.
+diff --git c/crates/lianli-shared/src/template/widget_kind.rs w/crates/lianli-shared/src/template/widget_kind.rs
+index fb70042..c309d3f 100644
+--- c/crates/lianli-shared/src/template/widget_kind.rs
++++ w/crates/lianli-shared/src/template/widget_kind.rs
+@@ -1,6 +1,7 @@
+ use super::{BarOrientation, FontRef, ImageFit, TextAlign};
+ use crate::media::{SensorRange, SensorSourceConfig};
+ use serde::{Deserialize, Serialize};
++use std::collections::BTreeMap;
+ use std::path::PathBuf;
+ 
+ fn default_alpha() -> u8 {
+@@ -35,6 +36,28 @@ pub struct GradientStop {
+     pub alpha: u8,
+ }
+ 
++#[derive(Clone, Debug, Serialize, Deserialize)]
++pub struct VideoSelector {
++    /// Text file containing the active variant name. Missing, empty, and
++    /// unknown values all select the video's normal `path` as a fallback.
++    pub state_file: PathBuf,
++    /// Optional motion-command file in template-logical coordinates.
++    ///
++    /// The file contract is `v1 <seq> <center_x> <center_y> <duration_ms>`.
++    /// Device orientation is applied after the logical template is composed,
++    /// so a 90° output rotation maps logical X motion onto the encoded
++    /// display's Y axis and logical Y motion onto its X axis.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub position_file: Option<PathBuf>,
++    #[serde(default = "default_video_selector_poll_interval_ms")]
++    pub poll_interval_ms: u64,
++    /// Duration of the visual crossfade between selector variants.
++    #[serde(default)]
++    pub crossfade_ms: u64,
++    #[serde(default)]
++    pub variants: BTreeMap<String, PathBuf>,
++}
++
+ #[derive(Clone, Debug, Serialize, Deserialize)]
+ #[serde(tag = "type", rename_all = "snake_case")]
+ pub enum WidgetKind {
+@@ -169,6 +192,8 @@ pub enum WidgetKind {
+         opacity: f32,
+         #[serde(default)]
+         fit: ImageFit,
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        selector: Option<VideoSelector>,
+     },
+     Sparkline {
+         source: SensorSourceConfig,
+@@ -359,6 +384,10 @@ fn default_opacity() -> f32 {
+     1.0
+ }
+ 
++fn default_video_selector_poll_interval_ms() -> u64 {
++    500
++}
++
+ fn default_sparkline_history() -> u32 {
+     60
+ }
+@@ -571,3 +600,98 @@ impl WidgetKind {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::WidgetKind;
++
++    #[test]
++    fn legacy_video_json_uses_no_selector() {
++        let kind: WidgetKind = serde_json::from_str(
++            r#"{
++                "type": "video",
++                "path": "/tmp/background.mp4",
++                "loop_playback": true,
++                "opacity": 1.0,
++                "fit": "stretch"
++            }"#,
++        )
++        .expect("legacy video JSON should remain valid");
++
++        match kind {
++            WidgetKind::Video { selector, .. } => assert!(selector.is_none()),
++            _ => panic!("expected video widget"),
++        }
++    }
++
++    #[test]
++    fn video_selector_deserializes_named_variants() {
++        let kind: WidgetKind = serde_json::from_str(
++            r#"{
++                "type": "video",
++                "path": "/tmp/idle.png",
++                "selector": {
++                    "state_file": "/run/user/1000/agent-state",
++                    "position_file": "/run/user/1000/agent-position",
++                    "poll_interval_ms": 500,
++                    "crossfade_ms": 250,
++                    "variants": {
++                        "codex": "/tmp/codex.png",
++                        "claude": "/tmp/claude.png"
++                    }
++                }
++            }"#,
++        )
++        .expect("selector video JSON should be valid");
++
++        match kind {
++            WidgetKind::Video {
++                selector: Some(selector),
++                ..
++            } => {
++                assert_eq!(selector.poll_interval_ms, 500);
++                assert_eq!(selector.crossfade_ms, 250);
++                assert_eq!(
++                    selector
++                        .position_file
++                        .as_deref()
++                        .expect("position file")
++                        .to_string_lossy(),
++                    "/run/user/1000/agent-position"
++                );
++                assert_eq!(selector.variants.len(), 2);
++                assert_eq!(
++                    selector.variants["codex"].to_string_lossy(),
++                    "/tmp/codex.png"
++                );
++            }
++            _ => panic!("expected video widget with selector"),
++        }
++    }
++
++    #[test]
++    fn video_selector_motion_and_crossfade_are_backward_compatible() {
++        let kind: WidgetKind = serde_json::from_str(
++            r#"{
++                "type": "video",
++                "path": "/tmp/idle.png",
++                "selector": {
++                    "state_file": "/run/user/1000/agent-state"
++                }
++            }"#,
++        )
++        .expect("selector defaults should remain valid");
++
++        match kind {
++            WidgetKind::Video {
++                selector: Some(selector),
++                ..
++            } => {
++                assert_eq!(selector.poll_interval_ms, 500);
++                assert_eq!(selector.crossfade_ms, 0);
++                assert!(selector.position_file.is_none());
++            }
++            _ => panic!("expected video widget with selector"),
++        }
++    }
++}
+diff --git c/crates/lianli-shared/src/template_catalog.rs w/crates/lianli-shared/src/template_catalog.rs
+index 256f51b..4c1dc33 100644
+--- c/crates/lianli-shared/src/template_catalog.rs
++++ w/crates/lianli-shared/src/template_catalog.rs
+@@ -190,11 +190,23 @@ fn rewrite_asset_paths(template: &mut LcdTemplate, base: &std::path::Path) {
+     }
+     for widget in template.widgets.iter_mut() {
+         match &mut widget.kind {
+-            WidgetKind::Image { path, .. } | WidgetKind::Video { path, .. } => {
++            WidgetKind::Image { path, .. } => {
+                 if path.is_relative() {
+                     *path = base.join(&*path);
+                 }
+             }
++            WidgetKind::Video { path, selector, .. } => {
++                if path.is_relative() {
++                    *path = base.join(&*path);
++                }
++                if let Some(selector) = selector {
++                    for variant_path in selector.variants.values_mut() {
++                        if variant_path.is_relative() {
++                            *variant_path = base.join(&*variant_path);
++                        }
++                    }
++                }
++            }
+             WidgetKind::Label { font, .. } | WidgetKind::ValueText { font, .. } => {
+                 rewrite_font(font, base);
+             }

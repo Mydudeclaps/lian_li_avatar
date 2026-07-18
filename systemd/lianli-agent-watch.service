@@ -1,0 +1,14 @@
+[Unit]
+Description=Process, hook, thermal, and ambient state for the Lian Li OLED mascot
+After=graphical-session.target
+Before=lianli-daemon.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/lianli-agent-watch
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=default.target

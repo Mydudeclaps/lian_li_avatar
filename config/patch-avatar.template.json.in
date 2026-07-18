@@ -1,0 +1,331 @@
+{
+  "id": "patch-avatar",
+  "name": "Patch — Coding Deckhand",
+  "base_width": 2288,
+  "base_height": 1048,
+  "rotated": false,
+  "background": {
+    "type": "color",
+    "rgb": [
+      0,
+      0,
+      0,
+      255
+    ]
+  },
+  "widgets": [
+    {
+      "id": "agent-mascot",
+      "x": 1144,
+      "y": 720,
+      "width": 600,
+      "height": 400,
+      "fps": 10,
+      "kind": {
+        "type": "video",
+        "path": "@ASSET_ROOT@/mascot/animations/patch-idle-v3.png",
+        "loop_playback": true,
+        "opacity": 1.0,
+        "fit": "stretch",
+        "selector": {
+          "state_file": "@RUNTIME_DIR@/lianli-agent-state",
+          "position_file": "@RUNTIME_DIR@/lianli-agent-position",
+          "poll_interval_ms": 100,
+          "crossfade_ms": 250,
+          "variants": {
+            "codex-enter": "@ASSET_ROOT@/mascot/animations/patch-enter-v3.png",
+            "codex-active": "@ASSET_ROOT@/mascot/animations/patch-codex-active-v3.png",
+            "codex-wait": "@ASSET_ROOT@/mascot/animations/patch-codex-wait-v3.png",
+            "codex-exit": "@ASSET_ROOT@/mascot/animations/patch-exit-v3.png",
+            "claude-enter": "@ASSET_ROOT@/mascot/animations/patch-enter-v3.png",
+            "claude-active": "@ASSET_ROOT@/mascot/animations/patch-claude-active-v3.png",
+            "claude-wait": "@ASSET_ROOT@/mascot/animations/patch-claude-wait-v3.png",
+            "claude-exit": "@ASSET_ROOT@/mascot/animations/patch-exit-v3.png",
+            "both-enter": "@ASSET_ROOT@/mascot/animations/patch-enter-v3.png",
+            "both-active": "@ASSET_ROOT@/mascot/animations/patch-both-active-v3.png",
+            "both-wait": "@ASSET_ROOT@/mascot/animations/patch-both-wait-v3.png",
+            "both-exit": "@ASSET_ROOT@/mascot/animations/patch-exit-v3.png",
+            "idle-blink": "@ASSET_ROOT@/mascot/animations/patch-idle-blink-v3.png",
+            "idle-hat-adjust": "@ASSET_ROOT@/mascot/animations/patch-idle-hat-adjust-v3.png",
+            "idle-stretch": "@ASSET_ROOT@/mascot/animations/patch-idle-stretch-v3.png",
+            "idle-mug": "@ASSET_ROOT@/mascot/animations/patch-idle-mug-v3.png",
+            "idle-gauge": "@ASSET_ROOT@/mascot/animations/patch-idle-gauge-v3.png",
+            "idle-breeze": "@ASSET_ROOT@/mascot/animations/patch-idle-breeze-v3.png",
+            "stroll-left": "@ASSET_ROOT@/mascot/animations/patch-stroll-left-v3.png",
+            "stroll-right": "@ASSET_ROOT@/mascot/animations/patch-stroll-right-v3.png",
+            "event-tool": "@ASSET_ROOT@/mascot/animations/patch-event-tool-v3.png",
+            "event-reading": "@ASSET_ROOT@/mascot/animations/patch-event-reading-v3.png",
+            "event-attention": "@ASSET_ROOT@/mascot/animations/patch-event-attention-v3.png",
+            "event-error": "@ASSET_ROOT@/mascot/animations/patch-event-error-v3.png",
+            "event-success": "@ASSET_ROOT@/mascot/animations/patch-event-success-v3.png",
+            "event-done": "@ASSET_ROOT@/mascot/animations/patch-event-done-v3.png",
+            "thermal-warm": "@ASSET_ROOT@/mascot/animations/patch-thermal-warm-v3.png",
+            "thermal-hot": "@ASSET_ROOT@/mascot/animations/patch-thermal-hot-v3.png",
+            "thermal-critical": "@ASSET_ROOT@/mascot/animations/patch-thermal-critical-v3.png",
+            "thermal-relief": "@ASSET_ROOT@/mascot/animations/patch-thermal-relief-v3.png",
+            "celebrate": "@ASSET_ROOT@/mascot/animations/patch-event-success-v3.png"
+          }
+        }
+      }
+    },
+    {
+      "id": "panels",
+      "x": 1144,
+      "y": 524,
+      "width": 2288,
+      "height": 1048,
+      "kind": {
+        "type": "image",
+        "path": "@ASSET_ROOT@/display/panels.png",
+        "opacity": 1.0,
+        "fit": "stretch"
+      }
+    },
+    {
+      "id": "label-cpu",
+      "x": 410,
+      "y": 585,
+      "width": 480,
+      "height": 60,
+      "kind": {
+        "type": "label",
+        "text": "CPU",
+        "font": {
+          "path": null
+        },
+        "font_size": 46,
+        "color": [
+          231,
+          216,
+          177,
+          255
+        ],
+        "align": "center",
+        "letter_spacing": 6
+      }
+    },
+    {
+      "id": "value-cpu",
+      "x": 410,
+      "y": 700,
+      "width": 520,
+      "height": 190,
+      "update_interval_ms": 1000,
+      "kind": {
+        "type": "value_text",
+        "source": {
+          "type": "command",
+          "cmd": "for d in /sys/class/hwmon/hwmon*; do if [ \"$(cat $d/name 2>/dev/null)\" = \"k10temp\" ]; then awk '{printf \"%.0f\\n\", $1/1000*9/5+32}' $d/temp1_input; break; fi; done"
+        },
+        "format": "{:.0}",
+        "unit": "°F",
+        "font": {
+          "path": null
+        },
+        "font_size": 140,
+        "color": [
+          240,
+          244,
+          255,
+          255
+        ],
+        "align": "center",
+        "value_min": 0,
+        "value_max": 250,
+        "ranges": [
+          {
+            "max": 167,
+            "color": [
+              240,
+              244,
+              255
+            ],
+            "alpha": 255
+          },
+          {
+            "max": 185,
+            "color": [
+              255,
+              190,
+              90
+            ],
+            "alpha": 255
+          },
+          {
+            "max": null,
+            "color": [
+              255,
+              90,
+              70
+            ],
+            "alpha": 255
+          }
+        ]
+      }
+    },
+    {
+      "id": "label-water",
+      "x": 410,
+      "y": 845,
+      "width": 480,
+      "height": 50,
+      "kind": {
+        "type": "label",
+        "text": "WATER",
+        "font": {
+          "path": null
+        },
+        "font_size": 40,
+        "color": [
+          231,
+          216,
+          177,
+          255
+        ],
+        "align": "center",
+        "letter_spacing": 6
+      }
+    },
+    {
+      "id": "value-water",
+      "x": 410,
+      "y": 920,
+      "width": 480,
+      "height": 100,
+      "update_interval_ms": 2000,
+      "kind": {
+        "type": "value_text",
+        "source": {
+          "type": "command",
+          "cmd": "for f in @RUNTIME_DIR@/lianli-coolant-*; do if [ -f \"$f\" ]; then awk '{printf \"%.0f\\n\", $1*9/5+32}' \"$f\"; break; fi; done"
+        },
+        "format": "{:.0}",
+        "unit": "°F",
+        "font": {
+          "path": null
+        },
+        "font_size": 78,
+        "color": [
+          140,
+          200,
+          255,
+          255
+        ],
+        "align": "center",
+        "value_min": 0,
+        "value_max": 250,
+        "ranges": [
+          {
+            "max": 111,
+            "color": [
+              140,
+              200,
+              255
+            ],
+            "alpha": 255
+          },
+          {
+            "max": 118,
+            "color": [
+              255,
+              190,
+              90
+            ],
+            "alpha": 255
+          },
+          {
+            "max": null,
+            "color": [
+              255,
+              90,
+              70
+            ],
+            "alpha": 255
+          }
+        ]
+      }
+    },
+    {
+      "id": "label-gpu",
+      "x": 1878,
+      "y": 610,
+      "width": 480,
+      "height": 60,
+      "kind": {
+        "type": "label",
+        "text": "GPU",
+        "font": {
+          "path": null
+        },
+        "font_size": 46,
+        "color": [
+          231,
+          216,
+          177,
+          255
+        ],
+        "align": "center",
+        "letter_spacing": 6
+      }
+    },
+    {
+      "id": "value-gpu",
+      "x": 1878,
+      "y": 765,
+      "width": 520,
+      "height": 220,
+      "update_interval_ms": 1000,
+      "kind": {
+        "type": "value_text",
+        "source": {
+          "type": "command",
+          "cmd": "for d in /sys/class/hwmon/hwmon*; do if [ \"$(cat $d/name 2>/dev/null)\" = \"amdgpu\" ] && [ \"$(cat $d/temp1_label 2>/dev/null)\" = \"edge\" ]; then awk '{printf \"%.0f\\n\", $1/1000*9/5+32}' $d/temp1_input; break; fi; done"
+        },
+        "format": "{:.0}",
+        "unit": "°F",
+        "font": {
+          "path": null
+        },
+        "font_size": 150,
+        "color": [
+          240,
+          244,
+          255,
+          255
+        ],
+        "align": "center",
+        "value_min": 0,
+        "value_max": 250,
+        "ranges": [
+          {
+            "max": 167,
+            "color": [
+              240,
+              244,
+              255
+            ],
+            "alpha": 255
+          },
+          {
+            "max": 194,
+            "color": [
+              255,
+              190,
+              90
+            ],
+            "alpha": 255
+          },
+          {
+            "max": null,
+            "color": [
+              255,
+              90,
+              70
+            ],
+            "alpha": 255
+          }
+        ]
+      }
+    }
+  ]
+}

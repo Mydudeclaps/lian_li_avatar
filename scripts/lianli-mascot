@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+state_file="$runtime_dir/lianli-agent-state"
+state_tmp="$runtime_dir/.lianli-agent-state.control.$$"
+position_file="$runtime_dir/lianli-agent-position"
+position_tmp="$runtime_dir/.lianli-agent-position.control.$$"
+watcher="lianli-agent-watch.service"
+event_writer="${LIANLI_AGENT_EVENT_BIN:-$HOME/.local/bin/lianli-agent-event}"
+
+usage() {
+  cat <<'EOF'
+usage:
+  lianli-mascot status|auto|demo
+  lianli-mascot STATE
+  lianli-mascot move {home|upper-left|up|upper-right|left|center|right|lower-left|down|lower-right} [duration-ms]
+  lianli-mascot event {codex|claude} {start|exit|tool|read|permission|error|success} [ttl-ms]
+
+States include idle, Codex/Claude/both enter|active|wait|exit, the idle-*
+micro-animations, stroll-left|right, event-*, thermal-*, and celebrate.
+EOF
+}
+
+set_state() {
+  local state="$1"
+  systemctl --user stop "$watcher"
+  printf '%s\n' "$state" >"$state_tmp"
+  mv -f -- "$state_tmp" "$state_file"
+  echo "Patch is forced to: $state"
+}
+
+move_to() {
+  local waypoint="$1"
+  local duration="${2:-1200}"
+  local x y
+  case "$waypoint" in
+    home) x=1144; y=720 ;;
+    upper-left) x=300; y=200 ;;
+    up|upper-center) x=1144; y=200 ;;
+    upper-right) x=1988; y=200 ;;
+    left|deck-left) x=300; y=524 ;;
+    center|mid) x=1144; y=524 ;;
+    right|deck-right) x=1988; y=524 ;;
+    lower-left) x=300; y=848 ;;
+    down) x=1144; y=848 ;;
+    lower-right) x=1988; y=848 ;;
+    *)
+      echo "unknown waypoint: $waypoint" >&2
+      usage
+      exit 2
+      ;;
+  esac
+  if ! [[ "$duration" =~ ^[0-9]+$ ]] || ((duration < 1 || duration > 30000)); then
+    echo "duration must be 1..30000 milliseconds" >&2
+    exit 2
+  fi
+  systemctl --user stop "$watcher"
+  printf 'v1 %s %s %s %s\n' "$(date +%s%N)" "$x" "$y" "$duration" >"$position_tmp"
+  mv -f -- "$position_tmp" "$position_file"
+  echo "Patch is moving to $waypoint (${x},${y}) over ${duration}ms."
+}
+
+case "${1:-status}" in
+  status)
+    watcher_state="$(systemctl --user is-active "$watcher" 2>/dev/null || true)"
+    display_state="$(cat "$state_file" 2>/dev/null || echo idle)"
+    display_position="$(cat "$position_file" 2>/dev/null || echo 'not-set')"
+    printf 'mode=%s state=%s position="%s"\n' "$watcher_state" "$display_state" "$display_position"
+    ;;
+  auto)
+    systemctl --user start "$watcher"
+    sleep 1
+    echo "Patch is following Codex and Claude automatically."
+    ;;
+  move)
+    move_to "${2:-home}" "${3:-1200}"
+    ;;
+  event)
+    if [[ -z "${2:-}" || -z "${3:-}" ]]; then
+      usage
+      exit 2
+    fi
+    if [[ -n "${4:-}" ]]; then
+      "$event_writer" "$2" "$3" --ttl-ms "$4"
+    else
+      "$event_writer" "$2" "$3"
+    fi
+    ;;
+  idle|\
+  codex-enter|codex-active|codex-wait|codex-exit|\
+  claude-enter|claude-active|claude-wait|claude-exit|\
+  both-enter|both-active|both-wait|both-exit|\
+  idle-blink|idle-hat-adjust|idle-stretch|idle-mug|idle-gauge|idle-breeze|\
+  stroll-left|stroll-right|\
+  event-tool|event-reading|event-attention|event-error|event-success|event-done|\
+  thermal-warm|thermal-hot|thermal-critical|thermal-relief|celebrate)
+    set_state "$1"
+    ;;
+  codex)
+    set_state codex-active
+    ;;
+  claude)
+    set_state claude-active
+    ;;
+  both)
+    set_state both-active
+    ;;
+  demo)
+    systemctl --user stop "$watcher"
+    trap 'systemctl --user start "$watcher" >/dev/null' EXIT
+    printf 'v1 %s 1144 720 1\n' "$(date +%s%N)" >"$position_tmp"
+    mv -f -- "$position_tmp" "$position_file"
+    for state in \
+      codex-enter codex-active event-tool codex-wait \
+      claude-enter claude-active event-reading claude-wait \
+      both-enter both-active both-wait \
+      idle-blink idle-hat-adjust idle-stretch idle-mug idle-gauge idle-breeze \
+      event-attention event-error event-success event-done \
+      thermal-warm thermal-hot thermal-critical thermal-relief; do
+      printf '%s\n' "$state" >"$state_tmp"
+      mv -f -- "$state_tmp" "$state_file"
+      echo "Demo: $state"
+      sleep 2
+    done
+    for waypoint in left right up down upper-left lower-right upper-right lower-left center home; do
+      case "$waypoint" in
+        upper-left) x=300; y=200; state=stroll-left ;;
+        up) x=1144; y=200; state=stroll-right ;;
+        upper-right) x=1988; y=200; state=stroll-right ;;
+        left) x=300; y=524; state=stroll-left ;;
+        center) x=1144; y=524; state=stroll-right ;;
+        right) x=1988; y=524; state=stroll-right ;;
+        lower-left) x=300; y=848; state=stroll-left ;;
+        down) x=1144; y=848; state=stroll-left ;;
+        lower-right) x=1988; y=848; state=stroll-right ;;
+        home) x=1144; y=720; state=stroll-left ;;
+      esac
+      printf '%s\n' "$state" >"$state_tmp"
+      mv -f -- "$state_tmp" "$state_file"
+      printf 'v1 %s %s %s 2400\n' "$(date +%s%N)" "$x" "$y" >"$position_tmp"
+      mv -f -- "$position_tmp" "$position_file"
+      echo "Demo: $state -> $waypoint"
+      sleep 3
+    done
+    printf '%s\n' idle >"$state_tmp"
+    mv -f -- "$state_tmp" "$state_file"
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
