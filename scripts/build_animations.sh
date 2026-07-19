@@ -535,6 +535,65 @@ make_nav_loop attention idle-07 345 10
 make_nav_stroll right
 make_nav_stroll left
 
+# --- team moments ------------------------------------------------------------
+# Paired two-frame loops for the crew-moment states (the watcher hands both
+# characters the same team-* state name; each widget maps it to its own side
+# of the scene). Each column of a team sheet is one clip: frame A in the top
+# row, frame B in the bottom row. Split the sheets with:
+#   scripts/prepare_pose_sheet.sh art_sprint/patch-team-sheet-v1.png 4x2 \
+#       assets/mascot/poses-team patch-team 10
+#   scripts/prepare_pose_sheet.sh art_sprint/navigator-team-sheet-v1.png 4x2 \
+#       assets/mascot/poses-team navigator-team 10
+# The section is skipped until those poses exist.
+team_poses="$root/poses-team"
+
+make_team_loop() {
+  local character="$1"   # patch | navigator; also selects the clip stream version
+  local output_name="$2" # team-huddle ...
+  local frame_a="$3"
+  local frame_b="$4"
+  local target_height="$5"
+  local version=v3
+  [[ "$character" == navigator ]] && version=v1
+  local frames=12
+  local dir="$work/$character-$output_name"
+  mkdir -p "$dir"
+  # Only four distinct frames exist (two poses x two bob offsets): render
+  # each once and copy into the remaining slots.
+  local -A rendered=()
+  local i pose bob key
+  for ((i=0; i<frames; i++)); do
+    pose="$frame_a"
+    if ((i >= frames / 2)); then
+      pose="$frame_b"
+    fi
+    bob=$((7 + (i % 6 == 2 || i % 6 == 3 ? 3 : 0)))
+    key="$pose-$bob"
+    if [[ -z "${rendered[$key]:-}" ]]; then
+      rendered[$key]="$dir/unique-$key.png"
+      render_asset "$team_poses/$character-team-$pose.png" "$target_height" 0 "$bob" false \
+        "${rendered[$key]}"
+    fi
+    cp -- "${rendered[$key]}" "$(frame_path "$dir" "$i")"
+  done
+  rm -f -- "$dir"/unique-*.png
+  encode_apng "$dir" "$animations/$character-$output_name-$version.png"
+  validate_asset "$animations/$character-$output_name-$version.png" "$frames"
+}
+
+if [[ -f "$team_poses/patch-team-01.png" ]]; then
+  make_team_loop patch team-huddle 01 05 345
+  make_team_loop patch team-toast 02 06 345
+  make_team_loop patch team-lookout 03 07 345
+  make_team_loop patch team-jig 04 08 350
+fi
+if [[ -f "$team_poses/navigator-team-01.png" ]]; then
+  make_team_loop navigator team-huddle 01 05 345
+  make_team_loop navigator team-toast 02 06 340
+  make_team_loop navigator team-lookout 03 07 345
+  make_team_loop navigator team-jig 04 08 350
+fi
+
 echo "Built and validated Patch v3 assets:"
 identify "$animations"/patch-*-v3.png
 echo "Built and validated navigator v1 assets:"
