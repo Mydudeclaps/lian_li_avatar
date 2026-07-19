@@ -133,6 +133,35 @@ Simple and deterministic, in priority order:
 All of this lives in the watcher and is unit-testable with the existing
 engine test harness.
 
+## Team moments (shipped July 2026)
+
+The one deliberate exception to the separation policy. A `TeamDirector`
+above the per-character engines stages a rendezvous when Patch and the
+navigator are both resting in auto mode (no agent activity, no events,
+thermal normal, no manual control):
+
+- On a random 8–18 minute cooldown the director picks a meeting spot
+  (three deck-row points and one center point) and walks the navigator to
+  the left slot and Patch to the right slot (±170 px from the center — near
+  enough to share a scene, far enough that the sprites' bodies never
+  overlap). Both engines receive the slower leg's walk duration so the pair
+  arrives together.
+- On arrival both engines hold the same paired state name for 8–14 s:
+  `team-huddle`, `team-toast`, `team-lookout`, or `team-jig`. Each widget's
+  selector maps the shared name to that character's side of the scene
+  (navigator faces right, Patch faces left).
+- Team phases sit at ambient priority (walk 120, pose 121): any agent
+  activity, event, thermal state, or touch-page command preempts them
+  per-engine, and the director aborts the partner on the next tick. If a
+  participant is merely busy at the scheduled time, the director retries
+  every 30 s instead of paying a full cooldown.
+- Config: global `teamMoments`/`team_moments` (default true), also
+  overridable per character in `character_settings`. A character with roam
+  disabled never joins a team moment.
+- Art: one 4×2 chroma sheet per character (columns = clips, rows = frames
+  A/B), split into `assets/mascot/poses-team/`, built as two-frame bob loops
+  by `make_team_loop` in build_animations.sh.
+
 ## Control bridge and touch page
 
 - `PatchControl` gains a `character` parameter (allowlisted against the

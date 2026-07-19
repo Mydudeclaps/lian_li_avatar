@@ -34,7 +34,11 @@
         "event-attention": "@ASSET_ROOT@/mascot/animations/navigator-attention-v1.png",
         "event-error": "@ASSET_ROOT@/mascot/animations/navigator-error-v1.png",
         "event-success": "@ASSET_ROOT@/mascot/animations/navigator-success-v1.png",
-        "event-done": "@ASSET_ROOT@/mascot/animations/navigator-success-v1.png"
+        "event-done": "@ASSET_ROOT@/mascot/animations/navigator-success-v1.png",
+        "team-huddle": "@ASSET_ROOT@/mascot/animations/navigator-team-huddle-v1.png",
+        "team-toast": "@ASSET_ROOT@/mascot/animations/navigator-team-toast-v1.png",
+        "team-lookout": "@ASSET_ROOT@/mascot/animations/navigator-team-lookout-v1.png",
+        "team-jig": "@ASSET_ROOT@/mascot/animations/navigator-team-jig-v1.png"
       }
     }
   }

@@ -63,7 +63,11 @@
             "thermal-hot": "@ASSET_ROOT@/mascot/animations/patch-thermal-hot-v3.png",
             "thermal-critical": "@ASSET_ROOT@/mascot/animations/patch-thermal-critical-v3.png",
             "thermal-relief": "@ASSET_ROOT@/mascot/animations/patch-thermal-relief-v3.png",
-            "celebrate": "@ASSET_ROOT@/mascot/animations/patch-event-success-v3.png"
+            "celebrate": "@ASSET_ROOT@/mascot/animations/patch-event-success-v3.png",
+            "team-huddle": "@ASSET_ROOT@/mascot/animations/patch-team-huddle-v3.png",
+            "team-toast": "@ASSET_ROOT@/mascot/animations/patch-team-toast-v3.png",
+            "team-lookout": "@ASSET_ROOT@/mascot/animations/patch-team-lookout-v3.png",
+            "team-jig": "@ASSET_ROOT@/mascot/animations/patch-team-jig-v3.png"
           }
         }
       }
@@ -115,7 +119,7 @@
         "type": "value_text",
         "source": {
           "type": "command",
-          "cmd": "for d in /sys/class/hwmon/hwmon*; do if [ \"$(cat $d/name 2>/dev/null)\" = \"k10temp\" ]; then awk '{printf \"%.0f\\n\", $1/1000*9/5+32}' $d/temp1_input; break; fi; done"
+          "cmd": "for d in /sys/class/hwmon/hwmon*; do read -r n < \"$d/name\" 2>/dev/null || continue; if [ \"$n\" = k10temp ]; then awk '{printf \"%.0f\\n\", $1/1000*9/5+32}' \"$d/temp1_input\"; break; fi; done"
         },
         "format": "{:.0}",
         "unit": "°F",
@@ -248,7 +252,7 @@
     {
       "id": "label-gpu",
       "x": 1878,
-      "y": 610,
+      "y": 585,
       "width": 480,
       "height": 60,
       "kind": {
@@ -271,22 +275,22 @@
     {
       "id": "value-gpu",
       "x": 1878,
-      "y": 765,
+      "y": 700,
       "width": 520,
-      "height": 220,
+      "height": 190,
       "update_interval_ms": 1000,
       "kind": {
         "type": "value_text",
         "source": {
           "type": "command",
-          "cmd": "for d in /sys/class/hwmon/hwmon*; do if [ \"$(cat $d/name 2>/dev/null)\" = \"amdgpu\" ] && [ \"$(cat $d/temp1_label 2>/dev/null)\" = \"edge\" ]; then awk '{printf \"%.0f\\n\", $1/1000*9/5+32}' $d/temp1_input; break; fi; done"
+          "cmd": "for d in /sys/class/hwmon/hwmon*; do read -r n < \"$d/name\" 2>/dev/null || continue; [ \"$n\" = amdgpu ] || continue; read -r l < \"$d/temp1_label\" 2>/dev/null || continue; if [ \"$l\" = edge ]; then awk '{printf \"%.0f\\n\", $1/1000*9/5+32}' \"$d/temp1_input\"; break; fi; done"
         },
         "format": "{:.0}",
         "unit": "°F",
         "font": {
           "path": null
         },
-        "font_size": 150,
+        "font_size": 140,
         "color": [
           240,
           244,
@@ -325,6 +329,276 @@
             "alpha": 255
           }
         ]
+      }
+    },
+    {
+      "id": "label-ssd",
+      "x": 1878,
+      "y": 828,
+      "width": 480,
+      "height": 44,
+      "kind": {
+        "type": "label",
+        "text": "SSD",
+        "font": {
+          "path": null
+        },
+        "font_size": 38,
+        "color": [
+          231,
+          216,
+          177,
+          255
+        ],
+        "align": "center",
+        "letter_spacing": 6
+      }
+    },
+    {
+      "id": "value-ssd-temp",
+      "x": 1878,
+      "y": 886,
+      "width": 480,
+      "height": 70,
+      "update_interval_ms": 2000,
+      "kind": {
+        "type": "value_text",
+        "source": {
+          "type": "command",
+          "cmd": "for d in /sys/class/hwmon/hwmon*; do read -r n < \"$d/name\" 2>/dev/null || continue; if [ \"$n\" = nvme ]; then awk '{printf \"%.0f\\n\", $1/1000*9/5+32}' \"$d/temp1_input\"; break; fi; done"
+        },
+        "format": "{:.0}",
+        "unit": "°F",
+        "font": {
+          "path": null
+        },
+        "font_size": 58,
+        "color": [
+          240,
+          244,
+          255,
+          255
+        ],
+        "align": "center",
+        "value_min": 0,
+        "value_max": 250,
+        "ranges": [
+          {
+            "max": 158,
+            "color": [
+              240,
+              244,
+              255
+            ],
+            "alpha": 255
+          },
+          {
+            "max": 176,
+            "color": [
+              255,
+              190,
+              90
+            ],
+            "alpha": 255
+          },
+          {
+            "max": null,
+            "color": [
+              255,
+              90,
+              70
+            ],
+            "alpha": 255
+          }
+        ]
+      }
+    },
+    {
+      "id": "label-ssd-used",
+      "x": 1715,
+      "y": 940,
+      "width": 160,
+      "height": 28,
+      "kind": {
+        "type": "label",
+        "text": "USED",
+        "font": {
+          "path": null
+        },
+        "font_size": 22,
+        "color": [
+          231,
+          216,
+          177,
+          255
+        ],
+        "align": "center",
+        "letter_spacing": 3
+      }
+    },
+    {
+      "id": "label-ssd-read",
+      "x": 1878,
+      "y": 940,
+      "width": 160,
+      "height": 28,
+      "kind": {
+        "type": "label",
+        "text": "READ",
+        "font": {
+          "path": null
+        },
+        "font_size": 22,
+        "color": [
+          231,
+          216,
+          177,
+          255
+        ],
+        "align": "center",
+        "letter_spacing": 3
+      }
+    },
+    {
+      "id": "label-ssd-write",
+      "x": 2041,
+      "y": 940,
+      "width": 160,
+      "height": 28,
+      "kind": {
+        "type": "label",
+        "text": "WRITE",
+        "font": {
+          "path": null
+        },
+        "font_size": 22,
+        "color": [
+          231,
+          216,
+          177,
+          255
+        ],
+        "align": "center",
+        "letter_spacing": 3
+      }
+    },
+    {
+      "id": "value-ssd-used",
+      "x": 1715,
+      "y": 972,
+      "width": 160,
+      "height": 34,
+      "update_interval_ms": 5000,
+      "kind": {
+        "type": "value_text",
+        "source": {
+          "type": "command",
+          "cmd": "df --output=pcent / 2>/dev/null | awk 'NR==2 {gsub(/[ %]/, \"\"); print}'"
+        },
+        "format": "{:.0}",
+        "unit": "%",
+        "font": {
+          "path": null
+        },
+        "font_size": 28,
+        "color": [
+          240,
+          244,
+          255,
+          255
+        ],
+        "align": "center",
+        "value_min": 0,
+        "value_max": 100,
+        "ranges": [
+          {
+            "max": 85,
+            "color": [
+              240,
+              244,
+              255
+            ],
+            "alpha": 255
+          },
+          {
+            "max": 95,
+            "color": [
+              255,
+              190,
+              90
+            ],
+            "alpha": 255
+          },
+          {
+            "max": null,
+            "color": [
+              255,
+              90,
+              70
+            ],
+            "alpha": 255
+          }
+        ]
+      }
+    },
+    {
+      "id": "value-ssd-read",
+      "x": 1878,
+      "y": 972,
+      "width": 160,
+      "height": 34,
+      "update_interval_ms": 1000,
+      "kind": {
+        "type": "value_text",
+        "source": {
+          "type": "disk_read",
+          "device": "@SSD_BLOCK_DEVICE@"
+        },
+        "format": "{:.0}",
+        "unit": " MB/s",
+        "font": {
+          "path": null
+        },
+        "font_size": 28,
+        "color": [
+          140,
+          200,
+          255,
+          255
+        ],
+        "align": "center",
+        "value_min": 0,
+        "value_max": 15000
+      }
+    },
+    {
+      "id": "value-ssd-write",
+      "x": 2041,
+      "y": 972,
+      "width": 160,
+      "height": 34,
+      "update_interval_ms": 1000,
+      "kind": {
+        "type": "value_text",
+        "source": {
+          "type": "disk_write",
+          "device": "@SSD_BLOCK_DEVICE@"
+        },
+        "format": "{:.0}",
+        "unit": " MB/s",
+        "font": {
+          "path": null
+        },
+        "font_size": 28,
+        "color": [
+          140,
+          200,
+          255,
+          255
+        ],
+        "align": "center",
+        "value_min": 0,
+        "value_max": 15000
       }
     }
   ]

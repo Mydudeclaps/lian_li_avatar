@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -46,6 +47,27 @@ def render(source: Path, destination: Path, replacements: dict[str, str]) -> Non
     atomic_write(destination, value)
 
 
+def root_block_device() -> str:
+    """Name of the whole disk backing / (e.g. nvme0n1), for /proc/diskstats."""
+    source = subprocess.run(
+        ["findmnt", "-no", "SOURCE", "/"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    # btrfs reports the subvolume as "/dev/nvme0n1p2[/@]".
+    source = source.split("[", 1)[0]
+    parent = subprocess.run(
+        ["lsblk", "-no", "PKNAME", source],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    if parent:
+        return parent[0]
+    return Path(source).name
+
+
 def absolute_path(value: str, label: str) -> str:
     path = Path(value).expanduser()
     if not path.is_absolute():
@@ -60,6 +82,11 @@ def main() -> None:
     parser.add_argument("--runtime-dir", required=True)
     parser.add_argument("--event-bin", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--ssd-device",
+        default=None,
+        help="block device name for SSD stats widgets (default: disk backing /)",
+    )
     args = parser.parse_args()
 
     output = Path(absolute_path(args.output_dir, "output directory"))
@@ -67,6 +94,7 @@ def main() -> None:
         "@ASSET_ROOT@": absolute_path(args.asset_root, "asset root"),
         "@RUNTIME_DIR@": absolute_path(args.runtime_dir, "runtime directory"),
         "@EVENT_BIN@": absolute_path(args.event_bin, "event binary"),
+        "@SSD_BLOCK_DEVICE@": args.ssd_device or root_block_device(),
     }
     jobs = (
         (
