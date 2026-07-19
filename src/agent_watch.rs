@@ -1366,6 +1366,16 @@ fn squared_distance(left: Point, right: Point) -> i64 {
     dx * dx + dy * dy
 }
 
+/// Separation policy: a roam may not begin toward a waypoint within this
+/// distance of another character's reserved point.
+const RESERVATION_RADIUS: i64 = 500;
+
+fn waypoint_is_free(target: Waypoint, occupied: &[Point]) -> bool {
+    occupied.iter().all(|point| {
+        squared_distance(target.point(), *point) > RESERVATION_RADIUS * RESERVATION_RADIUS
+    })
+}
+
 #[cfg(test)]
 fn movement_duration_ms(from: Point, to: Point) -> u64 {
     movement_duration_for_pace(from, to, RoamPace::Normal)
@@ -1501,6 +1511,10 @@ struct EngineInput {
     thermal_sample: Option<Temperatures>,
     settings: ControlSettings,
     controls: Vec<ControlCommand>,
+    /// Points other roster characters rest on or walk toward. A character
+    /// never *starts* a roam into this set; crossing paths mid-flight is
+    /// allowed and charming.
+    occupied: Vec<Point>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1791,7 +1805,12 @@ impl StateEngine {
         ScreenLocation::Center
     }
 
-    fn begin_roam(&mut self, now_ms: u64, settings: ControlSettings) -> PositionCommand {
+    fn begin_roam(
+        &mut self,
+        now_ms: u64,
+        settings: ControlSettings,
+        chosen: Option<Waypoint>,
+    ) -> PositionCommand {
         let (edge_from, edge_to) = if let Some((left, right)) = self.interrupted_edge.take() {
             let left_distance = squared_distance(self.position, left.point());
             let right_distance = squared_distance(self.position, right.point());
@@ -1801,7 +1820,7 @@ impl StateEngine {
                 (left, right)
             }
         } else {
-            let target = self.next_roam_target(settings.pattern);
+            let target = chosen.unwrap_or_else(|| self.next_roam_target(settings.pattern));
             (self.anchor, target)
         };
         let target = edge_to.point();
@@ -1916,6 +1935,7 @@ impl StateEngine {
         &mut self,
         now_ms: u64,
         settings: ControlSettings,
+        occupied: &[Point],
         position: &mut Option<PositionCommand>,
     ) {
         match self.ambient {
@@ -1937,9 +1957,36 @@ impl StateEngine {
                 self.schedule_ambient(now_ms);
             }
             None if now_ms >= self.next_ambient_ms => {
-                *position = Some(self.begin_roam(now_ms, settings));
+                // Roam reservation: re-roll a claimed waypoint once, and
+                // otherwise give this ambient slot back. An interrupted leg
+                // always finishes first — no mid-flight avoidance.
+                let mut chosen = None;
+                if self.interrupted_edge.is_none() {
+                    let mut target = self.next_roam_target(settings.pattern);
+                    if !waypoint_is_free(target, occupied) {
+                        target = self.next_roam_target(settings.pattern);
+                    }
+                    if !waypoint_is_free(target, occupied) {
+                        self.schedule_ambient(now_ms);
+                        return;
+                    }
+                    chosen = Some(target);
+                }
+                *position = Some(self.begin_roam(now_ms, settings, chosen));
             }
             _ => {}
+        }
+    }
+
+    /// The point other characters must not start a roam toward: the walk
+    /// destination while moving, the resting position otherwise.
+    fn reserved_point(&self) -> Point {
+        if let Some(AmbientPhase::Roam(motion)) = self.ambient {
+            motion.to
+        } else if let Some(motion) = self.manual_motion {
+            motion.to
+        } else {
+            self.position
         }
     }
 
@@ -2011,7 +2058,7 @@ impl StateEngine {
                 self.ambient_eligible = true;
                 self.schedule_ambient(input.now_ms);
             }
-            self.advance_ambient(input.now_ms, input.settings, &mut position);
+            self.advance_ambient(input.now_ms, input.settings, &input.occupied, &mut position);
         }
 
         let reactions_active = input.settings.activity_reactions;
@@ -2439,10 +2486,22 @@ fn main() -> io::Result<()> {
             None
         };
 
-        for character in &mut characters {
+        // Reservation points are snapshotted before stepping so ordering in
+        // the roster never favors one character within a tick.
+        let reserved: Vec<Point> = characters
+            .iter()
+            .map(|character| character.engine.reserved_point())
+            .collect();
+        for (index, character) in characters.iter_mut().enumerate() {
             // Signals are collected once and masked per character: events,
             // presence, and activity all route through the actor mask, and
             // thermal reactions are gated by the roster entry.
+            let occupied: Vec<Point> = reserved
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| *other != index)
+                .map(|(_, point)| *point)
+                .collect();
             let routed_events: Vec<EventRecord> = events
                 .iter()
                 .filter(|event| event.actor.mask() & character.actor_mask != 0)
@@ -2469,6 +2528,7 @@ fn main() -> io::Result<()> {
                 thermal_sample,
                 settings,
                 controls: routed_controls,
+                occupied,
             });
             if let Some(command) = output.position {
                 write_position(&character.position_path, command)?;
@@ -2539,6 +2599,7 @@ mod tests {
             thermal_sample: None,
             settings: ControlSettings::default(),
             controls: Vec::new(),
+            occupied: Vec::new(),
         }
     }
 
@@ -2796,6 +2857,57 @@ mod tests {
         assert!(parse_enabled_characters(r#"{"mode":"auto"}"#).is_empty());
         assert!(parse_enabled_characters(r#"{"characters":"navigator"}"#).is_empty());
         assert!(parse_enabled_characters(r#"{"characters":["navigator""#).is_empty());
+    }
+
+    #[test]
+    fn roam_reservation_rerolls_once_and_skips_claimed_slots() {
+        // The Full route begins Left, Right. With Left claimed by another
+        // character, the roam must re-roll onto Right.
+        let mut engine = StateEngine::new(23, 0, 800);
+        engine.step(input(0, 0));
+        engine.next_ambient_ms = 100;
+        let mut tick = input(100, 0);
+        tick.occupied = vec![ScreenLocation::Left.point()];
+        let rerolled = engine.step(tick);
+        assert_eq!(
+            rerolled.position.unwrap().point,
+            ScreenLocation::Right.point()
+        );
+
+        // With both the chosen and re-rolled waypoints claimed, the slot is
+        // given back: no walk starts and the next attempt is rescheduled.
+        let mut engine = StateEngine::new(23, 0, 800);
+        engine.step(input(0, 0));
+        engine.next_ambient_ms = 100;
+        let mut tick = input(100, 0);
+        tick.occupied = vec![ScreenLocation::Left.point(), ScreenLocation::Right.point()];
+        let skipped = engine.step(tick);
+        assert!(skipped.position.is_none());
+        assert!(engine.ambient.is_none());
+        assert!(engine.next_ambient_ms > 100);
+
+        // A stale claim releases the same waypoint later: the rescheduled
+        // attempt walks toward a route entry that is now free.
+        engine.next_ambient_ms = 200;
+        let freed = engine.step(input(200, 0));
+        assert!(freed.position.is_some());
+    }
+
+    #[test]
+    fn reserved_points_track_walks_and_rests() {
+        let mut engine = StateEngine::new(29, 0, 700);
+        engine.step(input(0, 0));
+        assert_eq!(engine.reserved_point(), ScreenLocation::Home.point());
+
+        engine.next_ambient_ms = 100;
+        let roaming = engine.step(input(100, 0));
+        let target = roaming.position.unwrap().point;
+        assert_eq!(engine.reserved_point(), target);
+
+        let mut manual = input(200, 0);
+        manual.controls = vec![ControlCommand::Move(ScreenLocation::UpperRight)];
+        engine.step(manual);
+        assert_eq!(engine.reserved_point(), ScreenLocation::UpperRight.point());
     }
 
     #[test]

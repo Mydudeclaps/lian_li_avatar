@@ -11,10 +11,19 @@ enabled by listing her in the `characters` array of mascot-control.json, and
 her v1 animation set builds from `assets/mascot/poses-navigator/`; see
 `config/navigator-widget.example.json.in` for her template widget.
 
-Not yet implemented from this design: per-character settings sections, the
-offset waypoint grids and roam reservation (separation today is distinct
-home anchors only), the dashboard's multi-character cards, and dropping the
-v1 compatibility output behind a config flag.
+The separation policy ships as distinct home anchors plus the roam
+reservation: a character never starts a roam toward a waypoint within
+500 px of another character's resting point or walk destination — it
+re-rolls once and otherwise gives the ambient slot back; mid-flight
+crossings stay allowed. The offset waypoint grids from the original
+draft were dropped deliberately: the shared 3×3 grid already spans the
+full envelope that keeps a 600×400 sprite on screen, so any fixed shift
+either clips sprites at the edge columns or collapses back onto the
+shared points, and the reservation covers the conflicts the offsets were
+meant to prevent.
+
+Not yet implemented from this design: per-character settings sections and
+dropping the v1 compatibility output behind a config flag.
 
 ## Goal
 

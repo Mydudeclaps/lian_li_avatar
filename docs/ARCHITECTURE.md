@@ -46,7 +46,11 @@ Events route to every character whose actor mask includes the emitting
 agent; commands address one character via the optional v2 field
 (`v1 <ms> <character|-> <command> <argument>`), with four-field v1 records
 resolving to `patch`, which also keeps writing the un-suffixed v1 files
-until templates are migrated.
+until templates are migrated. Characters keep apart through distinct home
+anchors and a roam reservation: no roam starts toward a waypoint within
+500 px of another character's resting point or walk destination (one
+re-roll, then the ambient slot is skipped); mid-flight crossings are
+allowed.
 
 Event and control records are published as one file per record —
 `<name>.<20-digit zero-padded created-ms>.<pid>` — so bursts inside one
