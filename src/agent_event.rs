@@ -9,6 +9,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const MIN_TTL_MS: u64 = 250;
 const MAX_TTL_MS: u64 = 60_000;
 const MAX_RECORD_BYTES: usize = 512;
+/// Upper bound on undelivered records per actor. If the watcher is not
+/// running, the oldest records are dropped so the runtime directory stays
+/// bounded and hooks keep succeeding.
+const MAX_QUEUED_RECORDS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Actor {
@@ -185,6 +189,45 @@ fn protocol_line(cli: Cli, created_ms: u64) -> String {
     format!("v1 {created_ms} {} {}\n", cli.kind.as_str(), cli.ttl_ms)
 }
 
+/// Queue-entry suffix: `<20-digit zero-padded created-ms>.<pid>`. The padded
+/// timestamp makes plain lexicographic filename order equal delivery order.
+fn queue_entry_suffix(created_ms: u64) -> String {
+    format!("{created_ms:020}.{}", process::id())
+}
+
+fn is_queue_entry_name(name: &str, prefix: &str) -> bool {
+    let Some(suffix) = name.strip_prefix(prefix) else {
+        return false;
+    };
+    let mut parts = suffix.splitn(2, '.');
+    let (Some(stamp), Some(pid)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    stamp.len() == 20
+        && !pid.is_empty()
+        && pid.len() <= 10
+        && stamp.bytes().all(|byte| byte.is_ascii_digit())
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Drop the oldest queued records for one actor until a new record fits
+/// within [`MAX_QUEUED_RECORDS`].
+fn prune_queue(runtime_dir: &Path, prefix: &str) -> io::Result<()> {
+    let mut pending: Vec<String> = fs::read_dir(runtime_dir)?
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| is_queue_entry_name(name, prefix))
+        .collect();
+    if pending.len() < MAX_QUEUED_RECORDS {
+        return Ok(());
+    }
+    pending.sort();
+    for name in &pending[..=pending.len() - MAX_QUEUED_RECORDS] {
+        let _ = fs::remove_file(runtime_dir.join(name));
+    }
+    Ok(())
+}
+
 fn emit(cli: Cli) -> io::Result<PathBuf> {
     let uid = effective_uid()?;
     let runtime_dir = runtime_dir(uid)?;
@@ -202,7 +245,7 @@ fn emit(cli: Cli) -> io::Result<PathBuf> {
     }
 
     let actor = cli.actor.as_str();
-    let destination = runtime_dir.join(format!("lianli-agent-event-{actor}"));
+    let prefix = format!("lianli-agent-event-{actor}.");
     let mut temporary = None;
     let mut file = None;
     for attempt in 0..16u8 {
@@ -244,11 +287,37 @@ fn emit(cli: Cli) -> io::Result<PathBuf> {
         return Err(error);
     }
     drop(file);
-    if let Err(error) = fs::rename(&temporary, &destination) {
+    // Prune only after the replacement is fully written, so a failed emit
+    // can never have destroyed a previously accepted record.
+    if let Err(error) = prune_queue(&runtime_dir, &prefix) {
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
-    Ok(destination)
+    // Publish without clobbering: `hard_link` fails if the destination
+    // exists, unlike `rename`, so an exact timestamp+pid collision (clock
+    // rollback plus pid reuse) shifts forward instead of losing a record.
+    for bump in 0..4u64 {
+        let destination = runtime_dir.join(format!(
+            "{prefix}{}",
+            queue_entry_suffix(created_ms.saturating_add(bump))
+        ));
+        match fs::hard_link(&temporary, &destination) {
+            Ok(()) => {
+                let _ = fs::remove_file(&temporary);
+                return Ok(destination);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                let _ = fs::remove_file(&temporary);
+                return Err(error);
+            }
+        }
+    }
+    let _ = fs::remove_file(&temporary);
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not reserve an event queue entry",
+    ))
 }
 
 fn run() -> Result<(), String> {
@@ -310,5 +379,61 @@ mod tests {
         let line = protocol_line(cli, 1234);
         let fields: Vec<&str> = line.trim_end().split(' ').collect();
         assert_eq!(fields, ["v1", "1234", "success", "8000"]);
+    }
+
+    #[test]
+    fn queue_entry_names_are_strict_and_sort_in_delivery_order() {
+        let prefix = "lianli-agent-event-codex.";
+        let early = format!("{prefix}{}", queue_entry_suffix(9));
+        let late = format!("{prefix}{}", queue_entry_suffix(10));
+        assert!(is_queue_entry_name(&early, prefix));
+        assert!(is_queue_entry_name(&late, prefix));
+        assert!(early < late, "{early} should sort before {late}");
+
+        for invalid in [
+            "lianli-agent-event-codex".to_string(),
+            format!("{prefix}12.34"),
+            format!("{prefix}{}", "9".repeat(20)),
+            format!("{prefix}{}.abc", "0".repeat(20)),
+            format!("{prefix}{}.{}", "0".repeat(20), "1".repeat(11)),
+            format!(".hidden.{}", queue_entry_suffix(9)),
+        ] {
+            assert!(!is_queue_entry_name(&invalid, prefix), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn prune_drops_only_the_oldest_records_beyond_the_cap() {
+        let directory = env::temp_dir().join(format!(
+            "lianli-agent-event-prune-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let prefix = "lianli-agent-event-claude.";
+        for created_ms in 0..MAX_QUEUED_RECORDS as u64 + 4 {
+            let name = format!("{prefix}{created_ms:020}.7");
+            fs::write(directory.join(name), "v1 0 tool 1500\n").unwrap();
+        }
+        fs::write(directory.join("lianli-agent-event-codex.00000000000000000001.7"), "x").unwrap();
+
+        prune_queue(&directory, prefix).unwrap();
+
+        let mut remaining: Vec<String> = fs::read_dir(&directory)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.starts_with(prefix))
+            .collect();
+        remaining.sort();
+        assert_eq!(remaining.len(), MAX_QUEUED_RECORDS - 1);
+        assert_eq!(remaining[0], format!("{prefix}{:020}.7", 5));
+        assert!(directory
+            .join("lianli-agent-event-codex.00000000000000000001.7")
+            .exists());
+        fs::remove_dir_all(directory).unwrap();
     }
 }

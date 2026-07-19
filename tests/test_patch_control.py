@@ -92,36 +92,90 @@ class PatchControlTests(unittest.TestCase):
                     self.control.update_settings(payload)
                 self.assertEqual(self.config_file.read_bytes(), before)
 
+    def queued_commands(self):
+        return self.control._queued_command_files()
+
     def test_commands_have_exact_four_field_wire_format(self):
         auto = self.control.send_command({"command": "auto"})
         self.assertEqual(auto["mode"], "auto")
-        command_file = self.runtime_dir / COMMAND_FILE_NAME
+        [command_file] = self.queued_commands()
+        self.assertEqual(
+            command_file.name,
+            f"{COMMAND_FILE_NAME}.{1_000_000:020d}.{os.getpid()}",
+        )
         self.assertEqual(
             command_file.read_text(encoding="utf-8"),
             "v1 1000000 auto -\n",
         )
         self.assertEqual(command_file.stat().st_mode & 0o777, 0o600)
+        command_file.unlink()
 
         home = self.control.send_command({"command": "home"})
         self.assertEqual(home["mode"], "manual")
+        [command_file] = self.queued_commands()
         self.assertEqual(
             command_file.read_text(encoding="utf-8"),
             "v1 1000001 home -\n",
         )
+        command_file.unlink()
 
         self.control.send_command(
             {"command": "move", "location": "upper-left"}
         )
+        [command_file] = self.queued_commands()
         self.assertEqual(
             command_file.read_text(encoding="utf-8"),
             "v1 1000002 move upper-left\n",
         )
+        command_file.unlink()
         self.control.send_command({"command": "preview", "event": "success"})
+        [command_file] = self.queued_commands()
         self.assertEqual(
             command_file.read_text(encoding="utf-8"),
             "v1 1000003 preview success\n",
         )
         self.assertEqual(self.control.load_config()["mode"], "manual")
+
+    def test_rapid_commands_queue_in_order_without_loss(self):
+        self.control.send_command({"command": "move", "location": "right"})
+        self.control.send_command({"command": "preview", "event": "tool"})
+        self.control.send_command({"command": "auto"})
+        records = [
+            path.read_text(encoding="utf-8")
+            for path in self.queued_commands()
+        ]
+        self.assertEqual(
+            records,
+            [
+                "v1 1000000 move right\n",
+                "v1 1000001 preview tool\n",
+                "v1 1000002 auto -\n",
+            ],
+        )
+
+    def test_concurrent_bridge_instances_never_clobber_each_other(self):
+        # A second instance sharing the same wall clock (and pid) races the
+        # same millisecond; the exclusive publish must keep both records.
+        other = PatchControl(
+            config_file=self.config_file,
+            runtime_dir=self.runtime_dir,
+            clock_ms=self.clock,
+        )
+        self.control.send_command({"command": "move", "location": "left"})
+        other.send_command({"command": "move", "location": "right"})
+        records = sorted(
+            path.read_text(encoding="utf-8") for path in self.queued_commands()
+        )
+        self.assertEqual(len(records), 2)
+        self.assertIn("v1 1000000 move left\n", records)
+        self.assertTrue(any(" move right\n" in record for record in records))
+
+    def test_command_queue_is_bounded_with_a_clear_error(self):
+        for _ in range(16):
+            self.control.send_command({"command": "preview", "event": "tool"})
+        with self.assertRaises(PatchControlError):
+            self.control.send_command({"command": "auto"})
+        self.assertEqual(len(self.queued_commands()), 16)
 
     def test_command_payload_and_semantic_values_are_allowlisted(self):
         invalid = (
@@ -138,7 +192,7 @@ class PatchControlTests(unittest.TestCase):
             with self.subTest(payload=payload):
                 with self.assertRaises(PatchControlError):
                     self.control.send_command(payload)
-        self.assertFalse((self.runtime_dir / COMMAND_FILE_NAME).exists())
+        self.assertEqual(self.queued_commands(), [])
 
     def test_all_ui_locations_and_previews_are_accepted(self):
         for location in (
@@ -155,18 +209,18 @@ class PatchControlTests(unittest.TestCase):
             self.control.send_command(
                 {"command": "move", "location": location}
             )
+            latest = self.queued_commands()[-1]
             self.assertTrue(
-                (self.runtime_dir / COMMAND_FILE_NAME)
-                .read_text(encoding="utf-8")
-                .endswith(f" move {location}\n")
+                latest.read_text(encoding="utf-8").endswith(f" move {location}\n")
             )
+            latest.unlink()
         for event in ("tool", "read", "attention", "success"):
             self.control.send_command({"command": "preview", "event": event})
+            latest = self.queued_commands()[-1]
             self.assertTrue(
-                (self.runtime_dir / COMMAND_FILE_NAME)
-                .read_text(encoding="utf-8")
-                .endswith(f" preview {event}\n")
+                latest.read_text(encoding="utf-8").endswith(f" preview {event}\n")
             )
+            latest.unlink()
 
     def test_control_status_is_preferred_and_state_is_allowlisted(self):
         self.control.update_settings({"pace": "slow"})

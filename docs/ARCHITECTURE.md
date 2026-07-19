@@ -39,6 +39,19 @@ Event records contain no prompt or tool payload:
 v1 <created-unix-ms> <start|exit|tool|read|permission|error|success> <ttl-ms>
 ```
 
+Event and control records are published as one file per record —
+`<name>.<20-digit zero-padded created-ms>.<pid>` — so bursts inside one
+100 ms watcher tick cannot overwrite each other. Publication is
+no-clobber (link, not rename), and the watcher merges claimed records by
+embedded created-ms before applying them; records sharing one millisecond
+have no defined relative order. The watcher claims each record atomically by
+rename, always deletes what it claims, and sweeps abandoned claims and stale
+temporaries at startup. Queues are bounded per writer — writers drop the
+oldest records beyond 32 per actor and the control bridge rejects new
+commands beyond 16 pending — though simultaneous writers can briefly
+overshoot a bound by their count. The watcher also still consumes the legacy
+single-mailbox file names during upgrades.
+
 See the inline Rust and Python tests for strict parsing, ownership checks,
 stale-record rejection, animation priorities, roaming behavior, and the
 control API contract.

@@ -18,6 +18,11 @@ from pathlib import Path
 CONFIG_VERSION = 1
 CONFIG_FILE = Path.home() / ".config" / "lianli" / "mascot-control.json"
 COMMAND_FILE_NAME = "lianli-agent-command"
+# Commands are published as one queue file per record so rapid taps cannot
+# overwrite each other before the watcher's next 100 ms tick. The suffix
+# contract shared with the watcher is `.<20-digit created-ms>.<pid>`; the
+# padded timestamp makes lexicographic order equal delivery order.
+MAX_QUEUED_COMMANDS = 16
 CONTROL_STATUS_FILE_NAME = "lianli-agent-control-status"
 STATE_FILE_NAME = "lianli-agent-state"
 POSITION_FILE_NAME = "lianli-agent-position"
@@ -131,7 +136,13 @@ def _trusted_runtime_dir() -> Path:
     raise PatchControlError("No trusted user runtime directory is available")
 
 
-def _atomic_write(path: Path, value: str) -> None:
+def _atomic_write(path: Path, value: str, exclusive: bool = False) -> None:
+    """Atomically publish ``value`` at ``path``.
+
+    With ``exclusive=True`` the publish fails with :class:`FileExistsError`
+    instead of replacing an existing file, so concurrent queue writers can
+    never silently clobber each other's records.
+    """
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     for attempt in range(16):
         temporary = path.with_name(
@@ -151,14 +162,16 @@ def _atomic_write(path: Path, value: str) -> None:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.chmod(temporary, 0o600)
-            os.replace(temporary, path)
+            if exclusive:
+                os.link(temporary, path)
+            else:
+                os.replace(temporary, path)
             return
-        except BaseException:
+        finally:
             try:
                 temporary.unlink()
             except OSError:
                 pass
-            raise
     raise OSError("Could not reserve a temporary Patch control file")
 
 
@@ -204,9 +217,29 @@ class PatchControl:
         self._lock = threading.Lock()
         self._last_command_ms = 0
 
-    @property
-    def command_file(self) -> Path:
-        return self.runtime_dir / COMMAND_FILE_NAME
+    def _queued_command_files(self) -> list[Path]:
+        pending = []
+        prefix = COMMAND_FILE_NAME + "."
+        for path in self.runtime_dir.iterdir():
+            suffix = path.name.removeprefix(prefix)
+            if suffix == path.name:
+                continue
+            stamp, _, pid = suffix.partition(".")
+            if (
+                len(stamp) == 20
+                and stamp.isascii()
+                and stamp.isdigit()
+                and 1 <= len(pid) <= 10
+                and pid.isascii()
+                and pid.isdigit()
+            ):
+                pending.append(path)
+        return sorted(pending)
+
+    def _command_queue_entry(self, created_ms: int) -> Path:
+        return self.runtime_dir / (
+            f"{COMMAND_FILE_NAME}.{created_ms:020d}.{os.getpid()}"
+        )
 
     def load_config(self) -> dict:
         try:
@@ -279,6 +312,10 @@ class PatchControl:
                 raise PatchControlError("Preview must be tool, read, attention, or success")
 
         with self._lock:
+            if len(self._queued_command_files()) >= MAX_QUEUED_COMMANDS:
+                raise PatchControlError(
+                    "Too many queued mascot commands; try again shortly"
+                )
             config = self.load_config()
             if command == "auto":
                 config["mode"] = "auto"
@@ -286,11 +323,24 @@ class PatchControl:
             elif command in {"home", "move"}:
                 config["mode"] = "manual"
                 self._save_config(config)
-            created_ms = self._next_command_ms()
-            _atomic_write(
-                self.command_file,
-                f"v1 {created_ms} {command} {argument}\n",
-            )
+            # Timestamps are only unique within this instance; another
+            # bridge instance or process can race the same millisecond, so
+            # publish without clobbering and re-stamp on collision.
+            for _ in range(8):
+                created_ms = self._next_command_ms()
+                try:
+                    _atomic_write(
+                        self._command_queue_entry(created_ms),
+                        f"v1 {created_ms} {command} {argument}\n",
+                        exclusive=True,
+                    )
+                    break
+                except FileExistsError:
+                    continue
+            else:
+                raise PatchControlError(
+                    "Could not reserve a mascot command slot; try again"
+                )
         return self.snapshot()
 
     def _control_status(self) -> tuple[str, str] | None:

@@ -514,35 +514,117 @@ fn parse_event_record(actor: AgentActor, bytes: &[u8], now_unix_ms: u64) -> Opti
     Some(record)
 }
 
-fn consume_agent_event(
+/// Queue-entry suffix contract shared with the writers:
+/// `<prefix><20-digit zero-padded created-ms>.<pid>`. Padding makes plain
+/// lexicographic filename order equal delivery order.
+fn is_queue_entry_name(name: &str, prefix: &str) -> bool {
+    let Some(suffix) = name.strip_prefix(prefix) else {
+        return false;
+    };
+    let mut parts = suffix.splitn(2, '.');
+    let (Some(stamp), Some(pid)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    stamp.len() == 20
+        && !pid.is_empty()
+        && pid.len() <= 10
+        && stamp.bytes().all(|byte| byte.is_ascii_digit())
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Atomically claim one record file and hand its validated bytes to `parse`.
+/// The claimed file is always deleted, even when validation fails, so
+/// malformed or expired records cannot wedge a queue.
+fn claim_record<T>(
+    source: &Path,
+    claim: &Path,
+    uid: u32,
+    max_bytes: u64,
+    parse: impl FnOnce(&[u8]) -> Option<T>,
+) -> Option<T> {
+    if fs::rename(source, claim).is_err() {
+        return None;
+    }
+    let record = (|| {
+        let metadata = fs::symlink_metadata(claim).ok()?;
+        if !metadata.file_type().is_file() || metadata.uid() != uid || metadata.len() > max_bytes {
+            return None;
+        }
+        let bytes = fs::read(claim).ok()?;
+        parse(&bytes)
+    })();
+    let _ = fs::remove_file(claim);
+    record
+}
+
+/// Drain up to `MAX_RECORDS_PER_TICK` queued records for one prefix in
+/// delivery order. Anything beyond the per-tick cap stays queued for the
+/// next 100 ms tick.
+fn drain_queue<T>(
+    runtime_dir: &Path,
+    prefix: &str,
+    uid: u32,
+    max_bytes: u64,
+    mut parse: impl FnMut(&[u8]) -> Option<T>,
+) -> Vec<T> {
+    const MAX_RECORDS_PER_TICK: usize = 8;
+    let Ok(entries) = fs::read_dir(runtime_dir) else {
+        return Vec::new();
+    };
+    let mut pending: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| is_queue_entry_name(name, prefix))
+        .collect();
+    pending.sort();
+    pending.truncate(MAX_RECORDS_PER_TICK);
+
+    let mut records = Vec::new();
+    for name in pending {
+        let source = runtime_dir.join(&name);
+        let claim = runtime_dir.join(format!(".{name}.watch-{}", process::id()));
+        if let Some(record) = claim_record(&source, &claim, uid, max_bytes, &mut parse) {
+            records.push(record);
+        }
+    }
+    records
+}
+
+fn consume_agent_events(
     runtime_dir: &Path,
     actor: AgentActor,
     uid: u32,
     now_unix_ms: u64,
-) -> Option<EventRecord> {
-    let source = runtime_dir.join(format!("lianli-agent-event-{}", actor.as_str()));
-    let claim = runtime_dir.join(format!(
+) -> Vec<EventRecord> {
+    // Writers older than the queue format still use one fixed mailbox file.
+    let legacy_source = runtime_dir.join(format!("lianli-agent-event-{}", actor.as_str()));
+    let legacy_claim = runtime_dir.join(format!(
         ".lianli-agent-event-{}.watch-{}",
         actor.as_str(),
         process::id()
     ));
-    if fs::rename(&source, &claim).is_err() {
-        return None;
-    }
+    let mut records: Vec<EventRecord> = claim_record(
+        &legacy_source,
+        &legacy_claim,
+        uid,
+        MAX_EVENT_RECORD_BYTES,
+        |bytes| parse_event_record(actor, bytes, now_unix_ms),
+    )
+    .into_iter()
+    .collect();
 
-    let record = (|| {
-        let metadata = fs::symlink_metadata(&claim).ok()?;
-        if !metadata.file_type().is_file()
-            || metadata.uid() != uid
-            || metadata.len() > MAX_EVENT_RECORD_BYTES
-        {
-            return None;
-        }
-        let bytes = fs::read(&claim).ok()?;
-        parse_event_record(actor, &bytes, now_unix_ms)
-    })();
-    let _ = fs::remove_file(claim);
-    record
+    records.extend(drain_queue(
+        runtime_dir,
+        &format!("lianli-agent-event-{}.", actor.as_str()),
+        uid,
+        MAX_EVENT_RECORD_BYTES,
+        |bytes| parse_event_record(actor, bytes, now_unix_ms),
+    ));
+    // A legacy record is not necessarily older than queued ones. Later
+    // records replace earlier same-actor-and-kind entries during ingestion,
+    // so deliver in created-ms order (stable: legacy first on exact ties).
+    records.sort_by_key(|record| record.created_ms);
+    records
 }
 
 fn unix_time_ms() -> io::Result<u64> {
@@ -763,7 +845,7 @@ enum ControlCommand {
     Preview(PreviewKind),
 }
 
-fn parse_control_record(bytes: &[u8], now_unix_ms: u64) -> Option<ControlCommand> {
+fn parse_control_record(bytes: &[u8], now_unix_ms: u64) -> Option<(u64, ControlCommand)> {
     if bytes.len() as u64 > MAX_CONTROL_RECORD_BYTES {
         return None;
     }
@@ -781,38 +863,41 @@ fn parse_control_record(bytes: &[u8], now_unix_ms: u64) -> Option<ControlCommand
     {
         return None;
     }
-    match command {
-        "auto" if argument == "-" => Some(ControlCommand::Auto),
-        "home" if argument == "-" => Some(ControlCommand::Home),
-        "move" => ScreenLocation::parse(argument).map(ControlCommand::Move),
-        "preview" => PreviewKind::parse(argument).map(ControlCommand::Preview),
-        _ => None,
-    }
+    let command = match command {
+        "auto" if argument == "-" => ControlCommand::Auto,
+        "home" if argument == "-" => ControlCommand::Home,
+        "move" => ControlCommand::Move(ScreenLocation::parse(argument)?),
+        "preview" => ControlCommand::Preview(PreviewKind::parse(argument)?),
+        _ => return None,
+    };
+    Some((created_ms, command))
 }
 
-fn consume_control_command(
-    runtime_dir: &Path,
-    uid: u32,
-    now_unix_ms: u64,
-) -> Option<ControlCommand> {
-    let source = runtime_dir.join("lianli-agent-command");
-    let claim = runtime_dir.join(format!(".lianli-agent-command.watch-{}", process::id()));
-    if fs::rename(&source, &claim).is_err() {
-        return None;
-    }
-    let command = (|| {
-        let metadata = fs::symlink_metadata(&claim).ok()?;
-        if !metadata.file_type().is_file()
-            || metadata.uid() != uid
-            || metadata.len() > MAX_CONTROL_RECORD_BYTES
-        {
-            return None;
-        }
-        let bytes = fs::read(&claim).ok()?;
-        parse_control_record(&bytes, now_unix_ms)
-    })();
-    let _ = fs::remove_file(claim);
-    command
+fn consume_control_commands(runtime_dir: &Path, uid: u32, now_unix_ms: u64) -> Vec<ControlCommand> {
+    // Bridges older than the queue format still use one fixed mailbox file.
+    let legacy_source = runtime_dir.join("lianli-agent-command");
+    let legacy_claim = runtime_dir.join(format!(".lianli-agent-command.watch-{}", process::id()));
+    let mut stamped: Vec<(u64, ControlCommand)> = claim_record(
+        &legacy_source,
+        &legacy_claim,
+        uid,
+        MAX_CONTROL_RECORD_BYTES,
+        |bytes| parse_control_record(bytes, now_unix_ms),
+    )
+    .into_iter()
+    .collect();
+
+    stamped.extend(drain_queue(
+        runtime_dir,
+        "lianli-agent-command.",
+        uid,
+        MAX_CONTROL_RECORD_BYTES,
+        |bytes| parse_control_record(bytes, now_unix_ms),
+    ));
+    // A legacy record is not necessarily older than queued ones: apply in
+    // created-ms order. The stable sort keeps legacy first on exact ties.
+    stamped.sort_by_key(|(created_ms, _)| *created_ms);
+    stamped.into_iter().map(|(_, command)| command).collect()
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -830,6 +915,30 @@ fn parse_temperature(value: &str, millidegrees: bool) -> Option<f32> {
     (parsed.is_finite() && (-50.0..=200.0).contains(&parsed)).then_some(parsed)
 }
 
+/// `tempN_label` file names for one hwmon device, in numeric channel order
+/// (`temp2` before `temp10`). The labeled channel is not always `temp1`:
+/// amdgpu exposes `edge`, `junction`, and `mem` as `temp1..temp3`, and other
+/// drivers start even later.
+fn hwmon_label_files(device: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(device) else {
+        return Vec::new();
+    };
+    let mut channels: Vec<(u16, String)> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter_map(|name| {
+            let channel = name
+                .strip_prefix("temp")?
+                .strip_suffix("_label")?
+                .parse::<u16>()
+                .ok()?;
+            (channel > 0).then_some((channel, name))
+        })
+        .collect();
+    channels.sort();
+    channels.into_iter().map(|(_, name)| name).collect()
+}
+
 fn read_hwmon_temperature(
     hwmon_root: &Path,
     expected_name: &str,
@@ -844,17 +953,20 @@ fn read_hwmon_temperature(
         if name.trim() != expected_name {
             continue;
         }
-        let Ok(label) = fs::read_to_string(path.join("temp1_label")) else {
-            continue;
-        };
-        if label.trim() != expected_label {
-            continue;
-        }
-        let Ok(input) = fs::read_to_string(path.join("temp1_input")) else {
-            continue;
-        };
-        if let Some(value) = parse_temperature(&input, true) {
-            return Some(value);
+        for label_file in hwmon_label_files(&path) {
+            let Ok(label) = fs::read_to_string(path.join(&label_file)) else {
+                continue;
+            };
+            if label.trim() != expected_label {
+                continue;
+            }
+            let input_file = format!("{}input", label_file.trim_end_matches("label"));
+            let Ok(input) = fs::read_to_string(path.join(input_file)) else {
+                continue;
+            };
+            if let Some(value) = parse_temperature(&input, true) {
+                return Some(value);
+            }
         }
     }
     None
@@ -1318,7 +1430,7 @@ struct EngineInput {
     events: Vec<EventRecord>,
     thermal_sample: Option<Temperatures>,
     settings: ControlSettings,
-    control: Option<ControlCommand>,
+    controls: Vec<ControlCommand>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1342,8 +1454,7 @@ struct StateEngine {
     anchor: Waypoint,
     interrupted_edge: Option<(Waypoint, Waypoint)>,
     manual_location: Option<ScreenLocation>,
-    manual_motion_until_ms: u64,
-    manual_motion_state: &'static str,
+    manual_motion: Option<Motion>,
     preview: Option<(PreviewKind, u64)>,
     route_cursor: usize,
     facing_right: bool,
@@ -1369,8 +1480,7 @@ impl StateEngine {
             anchor: Waypoint::Home,
             interrupted_edge: None,
             manual_location: None,
-            manual_motion_until_ms: 0,
-            manual_motion_state: "stroll-right",
+            manual_motion: None,
             preview: None,
             route_cursor: 0,
             facing_right: true,
@@ -1542,17 +1652,34 @@ impl StateEngine {
         }
     }
 
-    fn movement_state_toward(&mut self, target: Point) -> &'static str {
-        if target.x > self.position.x {
+    fn movement_state_from(&mut self, from: Point, target: Point) -> &'static str {
+        if target.x > from.x {
             self.facing_right = true;
             "stroll-right"
-        } else if target.x < self.position.x {
+        } else if target.x < from.x {
             self.facing_right = false;
             "stroll-left"
         } else if self.facing_right {
             "stroll-right"
         } else {
             "stroll-left"
+        }
+    }
+
+    fn movement_state_toward(&mut self, target: Point) -> &'static str {
+        let from = self.position;
+        self.movement_state_from(from, target)
+    }
+
+    /// Where the mascot visually is right now: mid-flight manual moves are
+    /// interpolated exactly like the renderer interpolates them, so a
+    /// retarget starts from the on-screen point rather than the old target.
+    fn current_point(&self, now_ms: u64) -> Point {
+        match self.manual_motion {
+            Some(motion) if now_ms < motion.started_ms.saturating_add(motion.duration_ms) => {
+                motion.point_at(now_ms)
+            }
+            _ => self.position,
         }
     }
 
@@ -1618,10 +1745,21 @@ impl StateEngine {
         pace: RoamPace,
     ) -> PositionCommand {
         let _ = self.cancel_ambient(now_ms);
+        // Retargeting mid-flight must pace the new leg from the on-screen
+        // interpolated point, not from the previous destination.
+        let from = self.current_point(now_ms);
         let target = location.point();
-        let duration_ms = movement_duration_for_pace(self.position, target, pace);
-        self.manual_motion_state = self.movement_state_toward(target);
-        self.manual_motion_until_ms = now_ms.saturating_add(duration_ms);
+        let duration_ms = movement_duration_for_pace(from, target, pace);
+        let state = self.movement_state_from(from, target);
+        self.manual_motion = Some(Motion {
+            from,
+            to: target,
+            edge_from: self.anchor,
+            edge_to: location,
+            started_ms: now_ms,
+            duration_ms,
+            state,
+        });
         self.position = target;
         self.anchor = location;
         self.interrupted_edge = None;
@@ -1637,8 +1775,10 @@ impl StateEngine {
     ) -> Option<PositionCommand> {
         match command {
             ControlCommand::Auto => {
+                // Auto releases manual mode but keeps any in-flight motion:
+                // the renderer finishes that walk, and a quick follow-up
+                // move must still retarget from the interpolated point.
                 self.manual_location = None;
-                self.manual_motion_until_ms = 0;
                 self.schedule_ambient(now_ms);
                 None
             }
@@ -1728,9 +1868,9 @@ impl StateEngine {
             None
         };
 
-        if let Some(command) = input.control {
+        for command in &input.controls {
             position = self
-                .apply_control(command, input.now_ms, input.settings)
+                .apply_control(*command, input.now_ms, input.settings)
                 .or(position);
         }
         if self
@@ -1816,8 +1956,10 @@ impl StateEngine {
                 AmbientPhase::MicroIdle { state, .. } => consider(115, state),
             }
         }
-        if input.now_ms < self.manual_motion_until_ms {
-            consider(165, self.manual_motion_state);
+        if let Some(motion) = self.manual_motion {
+            if input.now_ms < motion.started_ms.saturating_add(motion.duration_ms) {
+                consider(165, motion.state);
+            }
         }
         if input.settings.thermal_reactions {
             if relief_active {
@@ -1927,6 +2069,39 @@ fn watcher_pid_is_alive(pid: u32) -> bool {
         .is_some_and(|name| name.starts_with("lianli-agent-watch"))
 }
 
+/// Remove work files abandoned by crashed processes: claim files whose
+/// watcher pid is gone, and writer temporaries older than a minute. Runs
+/// once at startup, after the instance lock guarantees no live sibling.
+fn clean_stale_work_files(runtime_dir: &Path) {
+    let Ok(entries) = fs::read_dir(runtime_dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !name.starts_with(".lianli-agent-") {
+            continue;
+        }
+        let stale = if let Some((_, pid)) = name.rsplit_once(".watch-") {
+            pid.parse::<u32>().is_ok_and(|pid| !watcher_pid_is_alive(pid))
+        } else if name.ends_with(".tmp") {
+            entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age.as_secs() >= 60)
+        } else {
+            false
+        };
+        if stale {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn acquire_instance_lock(runtime_dir: &Path) -> io::Result<InstanceLock> {
     let path = runtime_dir.join(".lianli-agent-watch.lock");
     for _ in 0..2 {
@@ -1964,6 +2139,7 @@ fn main() -> io::Result<()> {
     let control_status_path = runtime_dir.join("lianli-agent-control-status");
     let control_config_path = control_config_path();
     let _instance_lock = acquire_instance_lock(&runtime_dir)?;
+    clean_stale_work_files(&runtime_dir);
 
     let mut previous_processes: HashMap<ProcKey, Counters> = HashMap::new();
     let mut cgroup_trackers: HashMap<String, CgroupTracker> = HashMap::new();
@@ -2103,12 +2279,10 @@ fn main() -> io::Result<()> {
             next_control_sample = cycle_started + CONTROL_INTERVAL;
             control_settings = read_control_settings(control_config_path.as_deref(), uid);
         }
-        let control = consume_control_command(&runtime_dir, uid, now_unix_ms);
+        let controls = consume_control_commands(&runtime_dir, uid, now_unix_ms);
         let mut events = Vec::with_capacity(2);
         for actor in [AgentActor::Codex, AgentActor::Claude] {
-            if let Some(event) = consume_agent_event(&runtime_dir, actor, uid, now_unix_ms) {
-                events.push(event);
-            }
+            events.extend(consume_agent_events(&runtime_dir, actor, uid, now_unix_ms));
         }
         let thermal_sample = if cycle_started >= next_thermal_sample {
             next_thermal_sample = cycle_started + THERMAL_INTERVAL;
@@ -2126,7 +2300,7 @@ fn main() -> io::Result<()> {
             events,
             thermal_sample,
             settings: control_settings,
-            control,
+            controls,
         });
         if let Some(command) = output.position {
             write_position(&position_path, command)?;
@@ -2185,7 +2359,7 @@ mod tests {
             events: Vec::new(),
             thermal_sample: None,
             settings: ControlSettings::default(),
-            control: None,
+            controls: Vec::new(),
         }
     }
 
@@ -2377,15 +2551,15 @@ mod tests {
         let now = 50_000;
         assert_eq!(
             parse_control_record(b"v1 49999 move lower-right\n", now),
-            Some(ControlCommand::Move(ScreenLocation::LowerRight))
+            Some((49_999, ControlCommand::Move(ScreenLocation::LowerRight)))
         );
         assert_eq!(
             parse_control_record(b"v1 50000 preview success\n", now),
-            Some(ControlCommand::Preview(PreviewKind::Success))
+            Some((50_000, ControlCommand::Preview(PreviewKind::Success)))
         );
         assert_eq!(
             parse_control_record(b"v1 50000 auto -\n", now),
-            Some(ControlCommand::Auto)
+            Some((50_000, ControlCommand::Auto))
         );
         for invalid in [
             "v2 50000 move left",
@@ -2409,7 +2583,7 @@ mod tests {
         engine.step(input(0, 0));
 
         let mut moving = input(100, 0);
-        moving.control = Some(ControlCommand::Move(ScreenLocation::Right));
+        moving.controls = vec![ControlCommand::Move(ScreenLocation::Right)];
         let output = engine.step(moving);
         assert_eq!(
             output.position.unwrap().point,
@@ -2430,7 +2604,7 @@ mod tests {
         assert_eq!(engine.control_status(), ("manual", ScreenLocation::Right));
 
         let mut automatic = input(300, 0);
-        automatic.control = Some(ControlCommand::Auto);
+        automatic.controls = vec![ControlCommand::Auto];
         engine.step(automatic);
         assert_eq!(engine.control_status().0, "auto");
     }
@@ -2507,9 +2681,93 @@ mod tests {
         fs::remove_file(&claim).unwrap();
         assert_eq!(fs::read_to_string(&source).unwrap(), "v1 10001 tool 1500\n");
 
-        let consumed = consume_agent_event(&directory, AgentActor::Codex, uid, 10_001).unwrap();
-        assert_eq!(consumed.kind, EventKind::Tool);
+        let consumed = consume_agent_events(&directory, AgentActor::Codex, uid, 10_001);
+        assert_eq!(consumed.len(), 1);
+        assert_eq!(consumed[0].kind, EventKind::Tool);
         assert!(!source.exists());
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn queued_event_bursts_are_delivered_in_order_without_loss() {
+        let directory = temporary_directory("event-burst");
+        let uid = effective_uid().unwrap();
+        // A tool event followed 5 ms later by a permission event, both inside
+        // one 100 ms tick: the old single mailbox lost the first record.
+        fs::write(
+            directory.join(format!("lianli-agent-event-codex.{:020}.41", 10_000)),
+            "v1 10000 tool 1500\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.join(format!("lianli-agent-event-codex.{:020}.42", 10_005)),
+            "v1 10005 permission 10000\n",
+        )
+        .unwrap();
+        // Junk that must be ignored: wrong prefix shape and non-numeric pid.
+        fs::write(directory.join("lianli-agent-event-codex.junk"), "x").unwrap();
+        fs::write(
+            directory.join(format!("lianli-agent-event-claude.{:020}.43", 10_001)),
+            "v1 10001 success 8000\n",
+        )
+        .unwrap();
+
+        let codex = consume_agent_events(&directory, AgentActor::Codex, uid, 10_050);
+        assert_eq!(
+            codex
+                .iter()
+                .map(|record| record.kind)
+                .collect::<Vec<_>>(),
+            vec![EventKind::Tool, EventKind::Permission]
+        );
+        let claude = consume_agent_events(&directory, AgentActor::Claude, uid, 10_050);
+        assert_eq!(claude.len(), 1);
+        assert_eq!(claude[0].kind, EventKind::Success);
+        // Consumed and junk-non-matching files: queue entries gone, junk kept.
+        assert!(directory.join("lianli-agent-event-codex.junk").exists());
+        assert!(consume_agent_events(&directory, AgentActor::Codex, uid, 10_050).is_empty());
+        fs::remove_file(directory.join("lianli-agent-event-codex.junk")).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn queued_control_commands_apply_sequentially_in_one_tick() {
+        let directory = temporary_directory("command-burst");
+        let uid = effective_uid().unwrap();
+        fs::write(
+            directory.join(format!("lianli-agent-command.{:020}.9", 20_000)),
+            "v1 20000 move upper-left\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.join(format!("lianli-agent-command.{:020}.9", 20_001)),
+            "v1 20001 preview success\n",
+        )
+        .unwrap();
+
+        let commands = consume_control_commands(&directory, uid, 20_050);
+        assert_eq!(
+            commands,
+            vec![
+                ControlCommand::Move(ScreenLocation::UpperLeft),
+                ControlCommand::Preview(PreviewKind::Success),
+            ]
+        );
+
+        // Both commands take effect in a single engine step: the move sets a
+        // manual destination and the preview overrides the visible state.
+        let mut engine = StateEngine::new(11, 0, 400);
+        engine.step(input(0, 0));
+        let mut burst = input(100, 0);
+        burst.now_unix_ms = 20_050;
+        burst.controls = commands;
+        let output = engine.step(burst);
+        assert_eq!(output.state, "event-success");
+        assert_eq!(
+            output.position.unwrap().point,
+            ScreenLocation::UpperLeft.point()
+        );
+        assert_eq!(engine.manual_location, Some(ScreenLocation::UpperLeft));
         fs::remove_dir(directory).unwrap();
     }
 
@@ -2781,6 +3039,172 @@ mod tests {
             read_hwmon_temperature(&directory, "amdgpu", "edge"),
             Some(65.0)
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn legacy_and_queued_records_merge_in_created_ms_order() {
+        let directory = temporary_directory("merge-order");
+        let uid = effective_uid().unwrap();
+        // A queued move published at 20_000 and a NEWER legacy auto at
+        // 20_010: chronological order must put auto last so it wins.
+        fs::write(
+            directory.join(format!("lianli-agent-command.{:020}.9", 20_000)),
+            "v1 20000 move upper-left\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.join("lianli-agent-command"),
+            "v1 20010 auto -\n",
+        )
+        .unwrap();
+        let commands = consume_control_commands(&directory, uid, 20_050);
+        assert_eq!(
+            commands,
+            vec![
+                ControlCommand::Move(ScreenLocation::UpperLeft),
+                ControlCommand::Auto,
+            ]
+        );
+
+        // Same for events: a newer legacy record must be ingested after an
+        // older queued one so it replaces it, not the reverse.
+        fs::write(
+            directory.join(format!("lianli-agent-event-codex.{:020}.9", 30_000)),
+            "v1 30000 tool 1500\n",
+        )
+        .unwrap();
+        fs::write(
+            directory.join("lianli-agent-event-codex"),
+            "v1 30010 read 1500\n",
+        )
+        .unwrap();
+        let events = consume_agent_events(&directory, AgentActor::Codex, uid, 30_050);
+        assert_eq!(
+            events.iter().map(|record| record.kind).collect::<Vec<_>>(),
+            vec![EventKind::Tool, EventKind::Read]
+        );
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn retarget_after_returning_to_auto_still_interpolates_the_walk() {
+        let mut engine = StateEngine::new(17, 0, 800);
+        engine.step(input(0, 0));
+
+        let mut first = input(100, 0);
+        first.controls = vec![ControlCommand::Move(ScreenLocation::Right)];
+        let first_command = engine.step(first).position.unwrap();
+
+        // Auto releases manual mode mid-flight but must not forget the
+        // in-flight walk...
+        let auto_ms = 100 + first_command.duration_ms / 4;
+        let mut auto = input(auto_ms, 0);
+        auto.controls = vec![ControlCommand::Auto];
+        engine.step(auto);
+        assert_eq!(engine.manual_location, None);
+        assert!(engine.manual_motion.is_some());
+
+        // ...so a quick follow-up move still paces from the on-screen point.
+        let retarget_ms = 100 + first_command.duration_ms / 2;
+        let on_screen = engine.current_point(retarget_ms);
+        assert_ne!(on_screen, ScreenLocation::Right.point());
+        let mut second = input(retarget_ms, 0);
+        second.controls = vec![ControlCommand::Move(ScreenLocation::Home)];
+        let second_command = engine.step(second).position.unwrap();
+        assert_eq!(
+            second_command.duration_ms,
+            movement_duration_for_pace(
+                on_screen,
+                ScreenLocation::Home.point(),
+                RoamPace::Normal
+            )
+        );
+    }
+
+    #[test]
+    fn mid_flight_manual_retarget_paces_from_the_interpolated_point() {
+        let mut engine = StateEngine::new(13, 0, 600);
+        engine.step(input(0, 0));
+
+        let mut first = input(100, 0);
+        first.controls = vec![ControlCommand::Move(ScreenLocation::Right)];
+        let first_command = engine.step(first).position.unwrap();
+        assert_eq!(first_command.point, ScreenLocation::Right.point());
+
+        // Retarget halfway through the walk. The new leg must be paced from
+        // the on-screen interpolated point, not from the old destination.
+        let halfway_ms = 100 + first_command.duration_ms / 2;
+        let on_screen = engine.current_point(halfway_ms);
+        assert_ne!(on_screen, ScreenLocation::Right.point());
+        assert_ne!(on_screen, ScreenLocation::Home.point());
+
+        let mut second = input(halfway_ms, 0);
+        second.controls = vec![ControlCommand::Move(ScreenLocation::Left)];
+        let second_command = engine.step(second).position.unwrap();
+        assert_eq!(second_command.point, ScreenLocation::Left.point());
+        assert_eq!(
+            second_command.duration_ms,
+            movement_duration_for_pace(
+                on_screen,
+                ScreenLocation::Left.point(),
+                RoamPace::Normal
+            )
+        );
+        assert_ne!(
+            second_command.duration_ms,
+            movement_duration_for_pace(
+                ScreenLocation::Right.point(),
+                ScreenLocation::Left.point(),
+                RoamPace::Normal
+            )
+        );
+        assert_eq!(engine.manual_motion.unwrap().state, "stroll-left");
+
+        // After the motion finishes, the visual point is the final target.
+        let settle_ms = halfway_ms + second_command.duration_ms;
+        assert_eq!(engine.current_point(settle_ms), ScreenLocation::Left.point());
+    }
+
+    #[test]
+    fn labeled_sensor_channels_beyond_temp1_are_discovered() {
+        let directory = temporary_directory("sensors-tempn");
+        let gpu = directory.join("hwmon3");
+        fs::create_dir(&gpu).unwrap();
+        fs::write(gpu.join("name"), "amdgpu\n").unwrap();
+        fs::write(gpu.join("temp1_label"), "edge\n").unwrap();
+        fs::write(gpu.join("temp1_input"), "55000\n").unwrap();
+        fs::write(gpu.join("temp2_label"), "junction\n").unwrap();
+        fs::write(gpu.join("temp2_input"), "71500\n").unwrap();
+        fs::write(gpu.join("temp3_label"), "mem\n").unwrap();
+        fs::write(gpu.join("temp3_input"), "80000\n").unwrap();
+        // A label file with an unreadable twin input must not abort discovery.
+        fs::write(gpu.join("temp4_label"), "hotspot\n").unwrap();
+        // Duplicate label on a two-digit channel: numeric order means the
+        // lowest channel (temp2) wins over temp10.
+        fs::write(gpu.join("temp10_label"), "junction\n").unwrap();
+        fs::write(gpu.join("temp10_input"), "99000\n").unwrap();
+
+        assert_eq!(
+            hwmon_label_files(&gpu),
+            vec![
+                "temp1_label",
+                "temp2_label",
+                "temp3_label",
+                "temp4_label",
+                "temp10_label"
+            ]
+        );
+        assert_eq!(
+            read_hwmon_temperature(&directory, "amdgpu", "junction"),
+            Some(71.5)
+        );
+        assert_eq!(
+            read_hwmon_temperature(&directory, "amdgpu", "mem"),
+            Some(80.0)
+        );
+        assert_eq!(read_hwmon_temperature(&directory, "amdgpu", "hotspot"), None);
+        assert_eq!(read_hwmon_temperature(&directory, "amdgpu", "vram"), None);
         fs::remove_dir_all(directory).unwrap();
     }
 
