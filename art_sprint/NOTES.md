@@ -196,3 +196,22 @@ Defect fixed 1: Removed the detached straight white fishing line from top-row po
 Defect fixed 2: Redrew bottom-row pose 3 with continuous bent legs connecting the hips to both raised boots.
 
 Defect fixed 3: Removed the white fist object from bottom-row pose 4; both hands are empty in the eyes-closed sneeze, with the teal scarf flying upward and no particles.
+
+## navigator-core-sheet-v1-r3.png
+
+Built-in image generation mode: conservative background-uniformity edit
+
+Exact image prompt:
+
+```text
+Use case: background-extraction
+Asset type: Patch LCD mascot chroma-green sprite sheet
+Input images: Image 1: authoritative edit target and sole source of layout/content; Image 2: identity reference only, do not edit it and do not copy its pose or composition into Image 1.
+Primary request: Edit Image 1 conservatively. Change ONLY its existing green backdrop into one perfectly flat, numerically uniform digital fill of RGB (0,255,0), hexadecimal #00FF00, across the entire canvas and every gap between all eight sprite cells.
+Subject and composition invariants: Preserve all eight characters exactly as they appear in Image 1: every pose, prop, edge, scale, position, costume detail, facial expression, line, and cel-shaded color. Preserve the exact canvas dimensions and the exact 4-by-2 layout. The bottom-row celebration pose has no star particles; keep it that way and add nothing.
+Backdrop constraints: Every background pixel must be the identical solid color #00FF00. No lighting variation, noise, speckle, texture, vignette, gradient, glow, shadow, floor plane, reflection, transparency, or compression artifacts.
+Edge constraints: Keep crisp, transparent-ready character and prop edges with no dark speckle, fringe, halo, erosion, expansion, redraw, or restyling. Do not use #00FF00 anywhere inside any character or prop.
+Avoid: any change whatsoever outside the green backdrop; no new objects, particles, text, watermark, or decoration.
+```
+
+Background-uniformity pass: Replaced the noisy chroma-green backdrop with a flat #00FF00 field while preserving the eight-pose sheet and keeping the bottom-row celebration pose free of star particles.

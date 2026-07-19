@@ -1,0 +1,41 @@
+{
+  "_comment": "Second-character widget for the navigator. Merge this object into the template's widgets array only after enabling \"characters\": [\"navigator\"] in mascot-control.json — the widget always renders its base clip, so it should not ship in a template whose roster does not include her. Render @ASSET_ROOT@ and @RUNTIME_DIR@ exactly as install.sh does for the main template.",
+  "id": "navigator-mascot",
+  "x": 300,
+  "y": 848,
+  "width": 600,
+  "height": 400,
+  "fps": 10,
+  "kind": {
+    "type": "video",
+    "path": "@ASSET_ROOT@/mascot/animations/navigator-idle-v1.png",
+    "loop_playback": true,
+    "opacity": 1.0,
+    "fit": "stretch",
+    "selector": {
+      "state_file": "@RUNTIME_DIR@/lianli-agent-state-navigator",
+      "position_file": "@RUNTIME_DIR@/lianli-agent-position-navigator",
+      "poll_interval_ms": 100,
+      "crossfade_ms": 250,
+      "variants": {
+        "codex-enter": "@ASSET_ROOT@/mascot/animations/navigator-enter-v1.png",
+        "codex-active": "@ASSET_ROOT@/mascot/animations/navigator-active-v1.png",
+        "codex-wait": "@ASSET_ROOT@/mascot/animations/navigator-wait-v1.png",
+        "codex-exit": "@ASSET_ROOT@/mascot/animations/navigator-exit-v1.png",
+        "idle-hat-adjust": "@ASSET_ROOT@/mascot/animations/navigator-ease-v1.png",
+        "idle-stretch": "@ASSET_ROOT@/mascot/animations/navigator-stretch-v1.png",
+        "idle-mug": "@ASSET_ROOT@/mascot/animations/navigator-drink-v1.png",
+        "idle-gauge": "@ASSET_ROOT@/mascot/animations/navigator-instrument-v1.png",
+        "idle-breeze": "@ASSET_ROOT@/mascot/animations/navigator-ease-v1.png",
+        "stroll-left": "@ASSET_ROOT@/mascot/animations/navigator-stroll-left-v1.png",
+        "stroll-right": "@ASSET_ROOT@/mascot/animations/navigator-stroll-right-v1.png",
+        "event-tool": "@ASSET_ROOT@/mascot/animations/navigator-scan-v1.png",
+        "event-reading": "@ASSET_ROOT@/mascot/animations/navigator-read-v1.png",
+        "event-attention": "@ASSET_ROOT@/mascot/animations/navigator-attention-v1.png",
+        "event-error": "@ASSET_ROOT@/mascot/animations/navigator-error-v1.png",
+        "event-success": "@ASSET_ROOT@/mascot/animations/navigator-success-v1.png",
+        "event-done": "@ASSET_ROOT@/mascot/animations/navigator-success-v1.png"
+      }
+    }
+  }
+}

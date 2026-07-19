@@ -468,5 +468,74 @@ make_pose_loop thermal-hot thermal-hot 350 blue 12
 make_critical
 make_pose_loop thermal-relief thermal-relief 350 blue 12
 
+# --- navigator (character 2) ------------------------------------------------
+# Built from the keyed sheet poses in poses-navigator/. She ships the
+# playable subset from docs/MULTI_CHARACTER.md; states without a variant
+# fall back to her widget's base clip in the template.
+nav_poses="$root/poses-navigator"
+
+render_nav() {
+  local name="$1"
+  shift
+  render_asset "$nav_poses/$name.png" "$@"
+}
+
+make_nav_loop() {
+  local output_name="$1"
+  local pose="$2"
+  local target_height="$3"
+  local frames="${4:-12}"
+  local dir="$work/nav-$output_name"
+  mkdir -p "$dir"
+  local i x bob
+  for ((i=0; i<frames; i++)); do
+    x=0
+    bob=$((7 + (i % 6 == 2 || i % 6 == 3 ? 3 : 0)))
+    if ((i % 8 == 5)); then
+      x=2
+    fi
+    render_nav "$pose" "$target_height" "$x" "$bob" false "$(frame_path "$dir" "$i")"
+  done
+  encode_apng "$dir" "$animations/navigator-$output_name-v1.png"
+  validate_asset "$animations/navigator-$output_name-v1.png" "$frames"
+}
+
+make_nav_stroll() {
+  local direction="$1"
+  local dir="$work/nav-stroll-$direction"
+  mkdir -p "$dir"
+  local flop=false
+  if [[ "$direction" == "left" ]]; then
+    flop=true
+  fi
+  local i frame bob
+  for ((i=0; i<12; i++)); do
+    frame=$((i % 6 + 1))
+    bob=$((frame == 2 || frame == 5 ? 8 : 11))
+    render_nav "walk-0$frame" 335 0 "$bob" "$flop" "$(frame_path "$dir" "$i")"
+  done
+  encode_apng "$dir" "$animations/navigator-stroll-$direction-v1.png"
+  validate_asset "$animations/navigator-stroll-$direction-v1.png" 12
+}
+
+make_nav_loop idle core-01 340 12
+make_nav_loop enter core-02 345 10
+make_nav_loop active core-03 345 12
+make_nav_loop wait core-04 340 16
+make_nav_loop read core-05 345 12
+make_nav_loop success core-07 350 16
+make_nav_loop exit core-08 345 10
+make_nav_loop stretch idle-01 350 12
+make_nav_loop ease idle-02 345 12
+make_nav_loop drink idle-03 340 14
+make_nav_loop instrument idle-04 345 12
+make_nav_loop scan idle-05 345 12
+make_nav_loop error idle-06 345 12
+make_nav_loop attention idle-07 345 10
+make_nav_stroll right
+make_nav_stroll left
+
 echo "Built and validated Patch v3 assets:"
 identify "$animations"/patch-*-v3.png
+echo "Built and validated navigator v1 assets:"
+identify "$animations"/navigator-*-v1.png
