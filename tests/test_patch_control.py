@@ -49,6 +49,31 @@ class PatchControlTests(unittest.TestCase):
         )
         self.assertEqual(self.control.load_config(), DEFAULT_CONFIG)
 
+    def test_old_shape_config_inherits_new_keys_without_reset(self):
+        # A file written by an older bridge lacks newer keys. It must load
+        # with its explicit values intact and the missing keys defaulted —
+        # the old exact-shape check invalidated the whole file, silently
+        # resetting every setting (and emptying the roster) on next save.
+        self.config_file.parent.mkdir()
+        old_shape = {
+            "version": CONFIG_VERSION,
+            "mode": "manual",
+            "roam_enabled": False,
+            "roam_pattern": "horizontal",
+            "pace": "quick",
+            "micro_idles": False,
+            "activity_reactions": True,
+            "thermal_reactions": True,
+        }
+        self.config_file.write_text(json.dumps(old_shape), encoding="utf-8")
+        loaded = self.control.load_config()
+        self.assertEqual(loaded["mode"], "manual")
+        self.assertFalse(loaded["roam_enabled"])
+        self.assertEqual(loaded["pace"], "quick")
+        self.assertEqual(loaded["characters"], [])
+        self.assertEqual(loaded["character_settings"], {})
+        self.assertTrue(loaded["team_moments"])
+
     def test_settings_are_strict_atomic_and_mode_600(self):
         snapshot = self.control.update_settings(
             {
@@ -69,6 +94,7 @@ class PatchControlTests(unittest.TestCase):
                 "microIdles": False,
                 "activityReactions": True,
                 "thermalReactions": False,
+                "teamMoments": True,
                 "characters": [],
                 "characterSettings": {},
             },
@@ -405,6 +431,7 @@ class PatchControlTests(unittest.TestCase):
                 "microIdles",
                 "activityReactions",
                 "thermalReactions",
+                "teamMoments",
                 "characters",
                 "characterSettings",
             },

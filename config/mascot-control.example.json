@@ -5,6 +5,7 @@
   "pace": "normal",
   "roam_enabled": true,
   "roam_pattern": "full",
+  "team_moments": true,
   "thermal_reactions": true,
   "version": 1
 }

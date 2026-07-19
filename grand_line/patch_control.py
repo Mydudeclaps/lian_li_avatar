@@ -60,6 +60,7 @@ DEFAULT_CONFIG = {
     "micro_idles": True,
     "activity_reactions": True,
     "thermal_reactions": True,
+    "team_moments": True,
     "characters": [],
     "character_settings": {},
 }
@@ -71,7 +72,13 @@ CHARACTER_PUBLIC_TO_DISK = {
     "microIdles": "micro_idles",
     "activityReactions": "activity_reactions",
     "thermalReactions": "thermal_reactions",
+    "teamMoments": "team_moments",
 }
+BOOL_SETTINGS = frozenset(
+    key
+    for key in CHARACTER_PUBLIC_TO_DISK.values()
+    if key not in {"roam_pattern", "pace"}
+)
 PUBLIC_TO_DISK = {
     **CHARACTER_PUBLIC_TO_DISK,
     "characters": "characters",
@@ -110,6 +117,10 @@ KNOWN_STATES = {
     "idle-breeze",
     "stroll-left",
     "stroll-right",
+    "team-huddle",
+    "team-toast",
+    "team-lookout",
+    "team-jig",
 }
 
 # Logical 2288x1048 destinations. These are used only to infer a friendly
@@ -133,12 +144,7 @@ class PatchControlError(ValueError):
 
 
 def _validate_disk_setting(key: str, value: object) -> None:
-    if key in {
-        "roam_enabled",
-        "micro_idles",
-        "activity_reactions",
-        "thermal_reactions",
-    }:
+    if key in BOOL_SETTINGS:
         if type(value) is not bool:
             raise PatchControlError(f"{key} must be a boolean")
     elif key == "roam_pattern":
@@ -249,20 +255,16 @@ def _atomic_write(path: Path, value: str, exclusive: bool = False) -> None:
 
 
 def _validate_config(value: object) -> dict:
-    if not isinstance(value, dict) or set(value) != set(DEFAULT_CONFIG):
+    # Unknown keys are rejected; missing keys inherit their defaults so
+    # files written by older bridges stay valid instead of resetting.
+    if not isinstance(value, dict) or not set(value) <= set(DEFAULT_CONFIG):
         raise PatchControlError("Invalid mascot configuration shape")
+    value = {**DEFAULT_CONFIG, **value}
     if value.get("version") != CONFIG_VERSION:
         raise PatchControlError("Unsupported mascot configuration version")
     if value.get("mode") not in {"auto", "manual"}:
         raise PatchControlError("mode must be auto or manual")
-    for key in (
-        "roam_pattern",
-        "pace",
-        "roam_enabled",
-        "micro_idles",
-        "activity_reactions",
-        "thermal_reactions",
-    ):
+    for key in CHARACTER_PUBLIC_TO_DISK.values():
         _validate_disk_setting(key, value.get(key))
     characters = value.get("characters")
     if (
