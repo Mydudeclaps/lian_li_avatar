@@ -712,6 +712,7 @@ struct ControlSettings {
     micro_idles: bool,
     activity_reactions: bool,
     thermal_reactions: bool,
+    team_moments: bool,
 }
 
 impl Default for ControlSettings {
@@ -724,6 +725,7 @@ impl Default for ControlSettings {
             micro_idles: true,
             activity_reactions: true,
             thermal_reactions: true,
+            team_moments: true,
         }
     }
 }
@@ -755,30 +757,41 @@ fn json_string<'a>(value: &'a str, key: &str) -> Option<&'a str> {
     (!parsed.contains(['\\', '\n', '\r'])).then_some(parsed)
 }
 
+fn json_bool_setting(value: &str, camel: &str, snake: &str) -> Option<bool> {
+    json_bool(value, camel).or_else(|| json_bool(value, snake))
+}
+
+/// Apply every overrideable settings key found in `fragment` on top of
+/// `settings`. Shared by the global parser and the per-character override
+/// path so a new key is added in exactly one place; absent keys inherit.
+fn apply_settings_overrides(fragment: &str, settings: &mut ControlSettings) {
+    settings.roam_enabled = json_bool_setting(fragment, "roamEnabled", "roam_enabled")
+        .unwrap_or(settings.roam_enabled);
+    settings.micro_idles =
+        json_bool_setting(fragment, "microIdles", "micro_idles").unwrap_or(settings.micro_idles);
+    settings.activity_reactions =
+        json_bool_setting(fragment, "activityReactions", "activity_reactions")
+            .unwrap_or(settings.activity_reactions);
+    settings.thermal_reactions =
+        json_bool_setting(fragment, "thermalReactions", "thermal_reactions")
+            .unwrap_or(settings.thermal_reactions);
+    settings.team_moments =
+        json_bool_setting(fragment, "teamMoments", "team_moments").unwrap_or(settings.team_moments);
+    settings.pattern = json_string(fragment, "pattern")
+        .or_else(|| json_string(fragment, "roam_pattern"))
+        .and_then(RoamPattern::parse)
+        .unwrap_or(settings.pattern);
+    settings.pace = json_string(fragment, "pace")
+        .and_then(RoamPace::parse)
+        .unwrap_or(settings.pace);
+}
+
 fn parse_control_settings(value: &str) -> ControlSettings {
     let mut settings = ControlSettings::default();
     settings.manual_mode = json_string(value, "mode")
         .map(|mode| mode == "manual")
         .unwrap_or(settings.manual_mode);
-    settings.roam_enabled = json_bool(value, "roamEnabled")
-        .or_else(|| json_bool(value, "roam_enabled"))
-        .unwrap_or(settings.roam_enabled);
-    settings.micro_idles = json_bool(value, "microIdles")
-        .or_else(|| json_bool(value, "micro_idles"))
-        .unwrap_or(settings.micro_idles);
-    settings.activity_reactions = json_bool(value, "activityReactions")
-        .or_else(|| json_bool(value, "activity_reactions"))
-        .unwrap_or(settings.activity_reactions);
-    settings.thermal_reactions = json_bool(value, "thermalReactions")
-        .or_else(|| json_bool(value, "thermal_reactions"))
-        .unwrap_or(settings.thermal_reactions);
-    settings.pattern = json_string(value, "pattern")
-        .or_else(|| json_string(value, "roam_pattern"))
-        .and_then(RoamPattern::parse)
-        .unwrap_or(settings.pattern);
-    settings.pace = json_string(value, "pace")
-        .and_then(RoamPace::parse)
-        .unwrap_or(settings.pace);
+    apply_settings_overrides(value, &mut settings);
     settings
 }
 
@@ -817,25 +830,7 @@ fn character_control_settings(config: &str, id: &str, base: ControlSettings) -> 
         return base;
     };
     let mut settings = base;
-    settings.roam_enabled = json_bool(fragment, "roamEnabled")
-        .or_else(|| json_bool(fragment, "roam_enabled"))
-        .unwrap_or(settings.roam_enabled);
-    settings.micro_idles = json_bool(fragment, "microIdles")
-        .or_else(|| json_bool(fragment, "micro_idles"))
-        .unwrap_or(settings.micro_idles);
-    settings.activity_reactions = json_bool(fragment, "activityReactions")
-        .or_else(|| json_bool(fragment, "activity_reactions"))
-        .unwrap_or(settings.activity_reactions);
-    settings.thermal_reactions = json_bool(fragment, "thermalReactions")
-        .or_else(|| json_bool(fragment, "thermal_reactions"))
-        .unwrap_or(settings.thermal_reactions);
-    settings.pattern = json_string(fragment, "pattern")
-        .or_else(|| json_string(fragment, "roam_pattern"))
-        .and_then(RoamPattern::parse)
-        .unwrap_or(settings.pattern);
-    settings.pace = json_string(fragment, "pace")
-        .and_then(RoamPace::parse)
-        .unwrap_or(settings.pace);
+    apply_settings_overrides(fragment, &mut settings);
     settings
 }
 
@@ -858,6 +853,7 @@ fn read_trusted_config(path: Option<&Path>, uid: u32) -> Option<String> {
     fs::read_to_string(path).ok()
 }
 
+#[cfg(test)]
 fn read_control_settings(path: Option<&Path>, uid: u32) -> ControlSettings {
     read_trusted_config(path, uid)
         .map(|value| parse_control_settings(&value))
@@ -1342,6 +1338,17 @@ impl XorShift64 {
         value
     }
 
+    /// Uniform pick over `0..len` that never repeats the previous pick:
+    /// a repeat advances to the next entry instead.
+    fn pick_no_repeat(&mut self, len: usize, last: &mut Option<usize>) -> usize {
+        let mut index = (self.next() as usize) % len;
+        if *last == Some(index) {
+            index = (index + 1) % len;
+        }
+        *last = Some(index);
+        index
+    }
+
     fn range_inclusive(&mut self, min: u64, max: u64) -> u64 {
         min + self.next() % (max - min + 1)
     }
@@ -1399,7 +1406,7 @@ impl ScreenLocation {
         }
     }
 
-    fn point(self) -> Point {
+    const fn point(self) -> Point {
         match self {
             Self::Home => Point { x: 1_144, y: 720 },
             Self::UpperLeft => Point { x: 300, y: 200 },
@@ -1540,8 +1547,28 @@ impl Motion {
 #[derive(Clone, Copy, Debug)]
 enum AmbientPhase {
     Roam(Motion),
-    MicroIdle { state: &'static str, until_ms: u64 },
+    MicroIdle {
+        state: &'static str,
+        until_ms: u64,
+    },
+    /// Walking toward a team-moment slot with a director-synced duration.
+    TeamWalk {
+        motion: Motion,
+        pose_state: &'static str,
+        pose_ms: u64,
+    },
+    /// Holding the paired team clip at the meeting slot.
+    TeamPose {
+        state: &'static str,
+        until_ms: u64,
+    },
 }
+
+/// Paired team-moment clips. Both participants are handed the same state
+/// name; each widget's selector maps it to that character's side of the
+/// scene (navigator on the left facing right, Patch on the right facing
+/// left).
+const TEAM_STATES: [&str; 4] = ["team-huddle", "team-toast", "team-lookout", "team-jig"];
 
 #[derive(Clone, Copy, Debug)]
 struct ActiveEvent {
@@ -1675,9 +1702,83 @@ impl StateEngine {
                     Some(self.issue_position(point, 0))
                 }
             }
+            // A cancelled team walk freezes in place with no resume leg:
+            // meeting slots are not route waypoints, so the next roam simply
+            // starts from wherever the character stopped.
+            Some(AmbientPhase::TeamWalk { motion, .. }) => {
+                let point = motion.point_at(now_ms);
+                self.position = point;
+                self.anchor = nearest_screen_location(point);
+                self.interrupted_edge = None;
+                Some(self.issue_position(point, 0))
+            }
             _ => None,
         };
         self.ambient_eligible = false;
+        command
+    }
+
+    /// Engine-local half of team-moment eligibility: resting or micro-idling
+    /// in auto mode with nothing demanding attention. The director layers
+    /// settings and partner checks on top.
+    fn team_ready(&self, now_ms: u64) -> bool {
+        self.manual_location.is_none()
+            && self.preview.is_none()
+            && self.transition.is_none()
+            && self.active_events.is_empty()
+            && self.thermal.level() == ThermalLevel::Normal
+            && self.interrupted_edge.is_none()
+            && self
+                .manual_motion
+                .is_none_or(|motion| now_ms >= motion.started_ms.saturating_add(motion.duration_ms))
+            && matches!(self.ambient, None | Some(AmbientPhase::MicroIdle { .. }))
+    }
+
+    fn team_active(&self) -> bool {
+        matches!(
+            self.ambient,
+            Some(AmbientPhase::TeamWalk { .. }) | Some(AmbientPhase::TeamPose { .. })
+        )
+    }
+
+    /// Start walking to a team-moment slot. The director passes the same
+    /// `duration_ms` (the slower participant's leg) to both engines so the
+    /// pair arrives together.
+    fn begin_team_walk(
+        &mut self,
+        now_ms: u64,
+        target: Point,
+        duration_ms: u64,
+        pose_state: &'static str,
+        pose_ms: u64,
+    ) -> PositionCommand {
+        let _ = self.cancel_ambient(now_ms);
+        let state = self.movement_state_toward(target);
+        let motion = Motion {
+            from: self.position,
+            to: target,
+            edge_from: self.anchor,
+            edge_to: nearest_screen_location(target),
+            started_ms: now_ms,
+            duration_ms,
+            state,
+        };
+        self.ambient = Some(AmbientPhase::TeamWalk {
+            motion,
+            pose_state,
+            pose_ms,
+        });
+        self.issue_position(target, duration_ms)
+    }
+
+    /// Director-driven abort: the partner dropped out, so leave the team
+    /// phase immediately and go back to ordinary ambient scheduling.
+    fn abort_team(&mut self, now_ms: u64) -> Option<PositionCommand> {
+        if !self.team_active() {
+            return None;
+        }
+        let command = self.cancel_ambient(now_ms);
+        self.schedule_ambient(now_ms);
         command
     }
 
@@ -1977,11 +2078,9 @@ impl StateEngine {
             "idle-gauge",
             "idle-breeze",
         ];
-        let mut index = (self.rng.next() as usize) % STATES.len();
-        if self.last_micro_index == Some(index) {
-            index = (index + 1) % STATES.len();
-        }
-        self.last_micro_index = Some(index);
+        let index = self
+            .rng
+            .pick_no_repeat(STATES.len(), &mut self.last_micro_index);
         AmbientPhase::MicroIdle {
             state: STATES[index],
             until_ms: now_ms + self.rng.range_inclusive(1_000, 3_000),
@@ -2009,9 +2108,24 @@ impl StateEngine {
                     self.schedule_ambient(now_ms);
                 }
             }
-            Some(AmbientPhase::MicroIdle { until_ms, .. }) if now_ms >= until_ms => {
+            Some(
+                AmbientPhase::MicroIdle { until_ms, .. } | AmbientPhase::TeamPose { until_ms, .. },
+            ) if now_ms >= until_ms => {
                 self.ambient = None;
                 self.schedule_ambient(now_ms);
+            }
+            Some(AmbientPhase::TeamWalk {
+                motion,
+                pose_state,
+                pose_ms,
+            }) if now_ms >= motion.started_ms.saturating_add(motion.duration_ms) => {
+                self.position = motion.to;
+                self.anchor = motion.edge_to;
+                self.interrupted_edge = None;
+                self.ambient = Some(AmbientPhase::TeamPose {
+                    state: pose_state,
+                    until_ms: now_ms.saturating_add(pose_ms),
+                });
             }
             None if now_ms >= self.next_ambient_ms => {
                 // Roam reservation: re-roll a claimed waypoint once, and
@@ -2038,12 +2152,9 @@ impl StateEngine {
     /// The point other characters must not start a roam toward: the walk
     /// destination while moving, the resting position otherwise.
     fn reserved_point(&self) -> Point {
-        if let Some(AmbientPhase::Roam(motion)) = self.ambient {
-            motion.to
-        } else if let Some(motion) = self.manual_motion {
-            motion.to
-        } else {
-            self.position
+        match self.ambient {
+            Some(AmbientPhase::Roam(motion) | AmbientPhase::TeamWalk { motion, .. }) => motion.to,
+            _ => self.manual_motion.map_or(self.position, |motion| motion.to),
         }
     }
 
@@ -2141,6 +2252,10 @@ impl StateEngine {
             match ambient {
                 AmbientPhase::Roam(motion) => consider(120, motion.state),
                 AmbientPhase::MicroIdle { state, .. } => consider(115, state),
+                AmbientPhase::TeamWalk { motion, .. } => consider(120, motion.state),
+                // Above roam and micro-idle, below activity and events: any
+                // real agent work preempts the crew moment.
+                AmbientPhase::TeamPose { state, .. } => consider(121, state),
             }
         }
         if let Some(motion) = self.manual_motion {
@@ -2336,6 +2451,177 @@ struct Character {
     last_control_status: String,
 }
 
+/// Coordinates two-character team moments above the per-character engines.
+/// The director only speaks to the engines through small primitives
+/// (`team_ready`, `begin_team_walk`, `abort_team`), so everything that
+/// makes a character busy — activity, events, thermal, manual control —
+/// always wins over a crew moment.
+struct TeamDirector {
+    rng: XorShift64,
+    next_ms: u64,
+    active: bool,
+    last_state_index: Option<usize>,
+}
+
+/// Center points the pair can meet at, derived from the roam grid so a grid
+/// retune moves the meetings with it: the Down waypoint, two points flanking
+/// it along the deck row, and Center.
+const MEETING_SPOTS: [Point; 4] = {
+    let down = ScreenLocation::Down.point();
+    [
+        Point {
+            x: down.x - 384,
+            y: down.y,
+        },
+        down,
+        Point {
+            x: down.x + 384,
+            y: down.y,
+        },
+        ScreenLocation::Center.point(),
+    ]
+};
+
+/// Horizontal slot offset from the meeting center: near enough to share a
+/// scene, far enough that the 600px-wide sprites' bodies never overlap.
+const TEAM_SLOT_OFFSET: i32 = 170;
+
+impl TeamDirector {
+    fn new(seed: u64) -> Self {
+        let mut rng = XorShift64::new(seed);
+        Self {
+            next_ms: rng.range_inclusive(480_000, 1_080_000),
+            rng,
+            active: false,
+            last_state_index: None,
+        }
+    }
+
+    /// Full cooldown between crew moments.
+    fn schedule(&mut self, now_ms: u64) {
+        self.next_ms = now_ms + self.rng.range_inclusive(480_000, 1_080_000);
+    }
+
+    /// Somebody was busy at the scheduled time: retry soon instead of
+    /// paying a whole cooldown for bad luck.
+    fn retry_soon(&mut self, now_ms: u64) {
+        self.next_ms = now_ms + 30_000;
+    }
+
+    fn pick_spot(&mut self) -> Point {
+        MEETING_SPOTS[(self.rng.next() as usize) % MEETING_SPOTS.len()]
+    }
+
+    fn pick_state(&mut self) -> &'static str {
+        TEAM_STATES[self
+            .rng
+            .pick_no_repeat(TEAM_STATES.len(), &mut self.last_state_index)]
+    }
+
+    /// One roster-loop tick: dissolve a moment that lost a participant, or
+    /// stage a new rendezvous when the pair is resting and the cooldown is
+    /// up. Runs before the engines step so freshly issued team walks are
+    /// reserved within the same tick.
+    fn tick(
+        &mut self,
+        characters: &mut [Character],
+        per_character_settings: &[ControlSettings],
+        global: ControlSettings,
+        any_agent_active: bool,
+        now_ms: u64,
+    ) -> io::Result<()> {
+        // The common tick is "nothing to do": bail on the cheap guards
+        // before paying for roster scans.
+        if !self.active && (!global.team_moments || global.manual_mode || now_ms < self.next_ms) {
+            return Ok(());
+        }
+        let (Some(nav_index), Some(patch_index)) = (
+            roster_index(characters, "navigator"),
+            roster_index(characters, DEFAULT_CHARACTER),
+        ) else {
+            return Ok(());
+        };
+
+        if self.active {
+            if !characters[nav_index].engine.team_active()
+                || !characters[patch_index].engine.team_active()
+            {
+                for index in [nav_index, patch_index] {
+                    if let Some(command) = characters[index].engine.abort_team(now_ms) {
+                        write_character_position(&characters[index], command)?;
+                    }
+                }
+                self.active = false;
+                self.schedule(now_ms);
+            }
+            return Ok(());
+        }
+
+        let ready = |index: usize| {
+            let settings = per_character_settings[index];
+            settings.roam_enabled
+                && settings.team_moments
+                && characters[index].engine.team_ready(now_ms)
+        };
+        if any_agent_active || !ready(nav_index) || !ready(patch_index) {
+            self.retry_soon(now_ms);
+            return Ok(());
+        }
+
+        // The navigator takes the left slot and Patch the right, matching
+        // the facing baked into the team clips.
+        let spot = self.pick_spot();
+        let slots = [
+            (nav_index, -TEAM_SLOT_OFFSET),
+            (patch_index, TEAM_SLOT_OFFSET),
+        ]
+        .map(|(index, dx)| {
+            (
+                index,
+                Point {
+                    x: spot.x + dx,
+                    y: spot.y,
+                },
+            )
+        });
+        // The slower leg's duration goes to both engines so the pair
+        // arrives at the same moment.
+        let leg = |(index, slot): (usize, Point)| {
+            movement_duration_for_pace(
+                characters[index].engine.position,
+                slot,
+                per_character_settings[index].pace,
+            )
+        };
+        let duration_ms = leg(slots[0]).max(leg(slots[1]));
+        let pose_state = self.pick_state();
+        let pose_ms = self.rng.range_inclusive(8_000, 14_000);
+        for (index, slot) in slots {
+            let command = characters[index]
+                .engine
+                .begin_team_walk(now_ms, slot, duration_ms, pose_state, pose_ms);
+            write_character_position(&characters[index], command)?;
+        }
+        eprintln!("team moment: {pose_state} at ({}, {})", spot.x, spot.y);
+        self.active = true;
+        Ok(())
+    }
+}
+
+fn roster_index(characters: &[Character], id: &str) -> Option<usize> {
+    characters.iter().position(|character| character.id == id)
+}
+
+/// Write a position command to a character's runtime file, mirroring to the
+/// legacy un-suffixed path while templates still reference it.
+fn write_character_position(character: &Character, command: PositionCommand) -> io::Result<()> {
+    write_position(&character.position_path, command)?;
+    if let Some(path) = &character.legacy_position_path {
+        write_position(path, command)?;
+    }
+    Ok(())
+}
+
 /// Ambient timing must never synchronize across characters: derive each
 /// engine seed from the shared seed and the character id.
 fn character_seed(seed: u64, id: &str) -> u64 {
@@ -2427,6 +2713,8 @@ fn main() -> io::Result<()> {
         .iter()
         .map(|character| character_control_settings(&initial_config, character.id, control_settings))
         .collect();
+
+    let mut team_director = TeamDirector::new(character_seed(seed, "team-director"));
 
     let mut mask = 0u8;
     let mut next_process_sample = Instant::now();
@@ -2557,6 +2845,14 @@ fn main() -> io::Result<()> {
             None
         };
 
+        team_director.tick(
+            &mut characters,
+            &per_character_settings,
+            control_settings,
+            codex_activity.active || claude_activity.active,
+            now_ms,
+        )?;
+
         // Reservation points are snapshotted before stepping so ordering in
         // the roster never favors one character within a tick.
         let reserved: Vec<Point> = characters
@@ -2602,10 +2898,7 @@ fn main() -> io::Result<()> {
                 occupied,
             });
             if let Some(command) = output.position {
-                write_position(&character.position_path, command)?;
-                if let Some(path) = &character.legacy_position_path {
-                    write_position(path, command)?;
-                }
+                write_character_position(character, command)?;
             }
             let (mode, location) = character.engine.control_status();
             let control_status = format!("v1 {mode} {}", location.as_str());
@@ -2841,6 +3134,7 @@ mod tests {
                 micro_idles: false,
                 activity_reactions: false,
                 thermal_reactions: true,
+                team_moments: true,
             }
         );
         let invalid = parse_control_settings(r#"{"pattern":"diagonal","pace":"warp"}"#);
@@ -3002,6 +3296,195 @@ mod tests {
         engine.next_ambient_ms = 200;
         let freed = engine.step(input(200, 0));
         assert!(freed.position.is_some());
+    }
+
+    #[test]
+    fn team_walk_synchronizes_arrival_and_holds_the_paired_pose() {
+        let mut patch = StateEngine::new(23, 0, 100);
+        let mut navigator = StateEngine::new(29, 0, 200).with_home(ScreenLocation::LowerLeft);
+        patch.step(input(0, 0));
+        navigator.step(input(0, 0));
+        assert!(patch.team_ready(0));
+        assert!(navigator.team_ready(0));
+
+        let spot = Point { x: 1_144, y: 848 };
+        let patch_slot = Point {
+            x: spot.x + TEAM_SLOT_OFFSET,
+            y: spot.y,
+        };
+        let nav_slot = Point {
+            x: spot.x - TEAM_SLOT_OFFSET,
+            y: spot.y,
+        };
+        // The director hands both engines the slower leg's duration.
+        let duration = movement_duration_for_pace(navigator.position, nav_slot, RoamPace::Normal)
+            .max(movement_duration_for_pace(patch.position, patch_slot, RoamPace::Normal));
+        let patch_walk = patch.begin_team_walk(10, patch_slot, duration, "team-toast", 9_000);
+        let nav_walk = navigator.begin_team_walk(10, nav_slot, duration, "team-toast", 9_000);
+        assert_eq!(patch_walk.duration_ms, duration);
+        assert_eq!(nav_walk.duration_ms, duration);
+        assert_eq!(patch_walk.point, patch_slot);
+        assert_eq!(nav_walk.point, nav_slot);
+        assert_eq!(patch.reserved_point(), patch_slot);
+        assert!(patch.team_active());
+
+        // Mid-walk both show a stroll; after arrival both hold the pose.
+        let mid = patch.step(input(10 + duration / 2, 0));
+        assert!(mid.state.starts_with("stroll-"));
+        let arrived_ms = 10 + duration + 20;
+        let patch_pose = patch.step(input(arrived_ms, 0));
+        let nav_pose = navigator.step(input(arrived_ms, 0));
+        assert_eq!(patch_pose.state, "team-toast");
+        assert_eq!(nav_pose.state, "team-toast");
+        assert_eq!(patch.position, patch_slot);
+        assert_eq!(navigator.position, nav_slot);
+
+        // The pose expires on its own and ambient scheduling resumes.
+        let done_ms = arrived_ms + 9_100;
+        let patch_done = patch.step(input(done_ms, 0));
+        assert_ne!(patch_done.state, "team-toast");
+        assert!(!patch.team_active());
+        assert!(patch.next_ambient_ms > done_ms);
+    }
+
+    #[test]
+    fn agent_activity_preempts_a_team_pose_and_abort_reaches_the_partner() {
+        let mut patch = StateEngine::new(23, 0, 100);
+        let mut navigator = StateEngine::new(29, 0, 200).with_home(ScreenLocation::LowerLeft);
+        patch.step(input(0, 0));
+        navigator.step(input(0, 0));
+        let duration = 2_000;
+        patch.begin_team_walk(0, Point { x: 1_314, y: 848 }, duration, "team-jig", 10_000);
+        navigator.begin_team_walk(0, Point { x: 974, y: 848 }, duration, "team-jig", 10_000);
+        patch.step(input(2_100, 0));
+        navigator.step(input(2_100, 0));
+        assert!(patch.team_active() && navigator.team_active());
+
+        // Codex goes active: Patch's own step drops the team phase in favor
+        // of the activity state.
+        let mut busy = input(2_200, CODEX);
+        busy.codex_active = true;
+        let preempted = patch.step(busy);
+        assert_ne!(preempted.state, "team-jig");
+        assert!(!patch.team_active());
+
+        // The director notices and aborts the partner explicitly.
+        let aborted = navigator.abort_team(2_300);
+        assert!(!navigator.team_active());
+        // Mid-pose the navigator already rests at her slot: no position
+        // rewrite is needed.
+        assert!(aborted.is_none());
+        assert!(navigator.next_ambient_ms > 2_300);
+
+        // Aborting mid-walk freezes at the interpolated point instead.
+        let mut walker = StateEngine::new(31, 0, 300);
+        walker.step(input(0, 0));
+        walker.begin_team_walk(0, Point { x: 1_314, y: 848 }, 4_000, "team-jig", 10_000);
+        let frozen = walker.abort_team(2_000).expect("mid-walk abort rewrites position");
+        assert_eq!(frozen.duration_ms, 0);
+        assert!(!walker.team_active());
+    }
+
+    #[test]
+    fn team_readiness_respects_manual_mode_and_busy_phases() {
+        let mut engine = StateEngine::new(23, 0, 100);
+        engine.step(input(0, 0));
+        assert!(engine.team_ready(0));
+
+        // Manual control blocks team moments until Auto releases it.
+        let mut manual = input(100, 0);
+        manual.controls = vec![ControlCommand::Move(ScreenLocation::UpperRight)];
+        engine.step(manual);
+        assert!(!engine.team_ready(30_000));
+        let mut release = input(30_100, 0);
+        release.controls = vec![ControlCommand::Auto];
+        engine.step(release);
+        assert!(engine.team_ready(30_200));
+
+        // A roam in flight is not interruptible for a team moment.
+        engine.next_ambient_ms = 31_000;
+        engine.step(input(31_000, 0));
+        assert!(matches!(engine.ambient, Some(AmbientPhase::Roam(_))));
+        assert!(!engine.team_ready(31_100));
+    }
+
+    #[test]
+    fn team_director_stages_and_dissolves_moments() {
+        let directory = temporary_directory("team-director");
+        let make_character = |id: &'static str, home: ScreenLocation, seed: u64| Character {
+            id,
+            actor_mask: CODEX | CLAUDE,
+            thermal_reactions: false,
+            engine: StateEngine::new(seed, 0, 1).with_home(home),
+            state_path: directory.join(format!("state-{id}")),
+            position_path: directory.join(format!("position-{id}")),
+            control_status_path: directory.join(format!("control-{id}")),
+            legacy_state_path: None,
+            legacy_position_path: None,
+            legacy_control_status_path: None,
+            last_state: String::new(),
+            last_control_status: String::new(),
+        };
+        let mut characters = vec![
+            make_character(DEFAULT_CHARACTER, ScreenLocation::Home, 23),
+            make_character("navigator", ScreenLocation::LowerLeft, 29),
+        ];
+        let settings = [ControlSettings::default(), ControlSettings::default()];
+        let mut director = TeamDirector::new(7);
+
+        // A busy agent defers with the short retry, not a full cooldown.
+        director.next_ms = 100;
+        director
+            .tick(&mut characters, &settings, ControlSettings::default(), true, 100)
+            .unwrap();
+        assert!(!director.active);
+        assert_eq!(director.next_ms, 100 + 30_000);
+
+        // Resting pair: the moment stages, both engines enter the team
+        // phase, and both position files are written.
+        director.next_ms = 200;
+        director
+            .tick(&mut characters, &settings, ControlSettings::default(), false, 200)
+            .unwrap();
+        assert!(director.active);
+        assert!(characters[0].engine.team_active());
+        assert!(characters[1].engine.team_active());
+        assert!(characters[0].position_path.exists());
+        assert!(characters[1].position_path.exists());
+
+        // One participant drops out; the director aborts the partner and
+        // pays a full cooldown before the next attempt.
+        let _ = characters[0].engine.cancel_ambient(300);
+        director
+            .tick(&mut characters, &settings, ControlSettings::default(), false, 300)
+            .unwrap();
+        assert!(!director.active);
+        assert!(!characters[1].engine.team_active());
+        assert!(director.next_ms >= 300 + 480_000);
+
+        // Disabled team moments never stage.
+        director.next_ms = 400;
+        let disabled = ControlSettings {
+            team_moments: false,
+            ..ControlSettings::default()
+        };
+        director
+            .tick(&mut characters, &settings, disabled, false, 400)
+            .unwrap();
+        assert!(!director.active);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn team_moment_settings_parse_globally_and_per_character() {
+        assert!(parse_control_settings(r#"{"mode":"auto"}"#).team_moments);
+        assert!(!parse_control_settings(r#"{"teamMoments": false}"#).team_moments);
+        assert!(!parse_control_settings(r#"{"team_moments": false}"#).team_moments);
+        let base = parse_control_settings(r#"{"teamMoments": true}"#);
+        let config = r#"{"character_settings": {"navigator": {"teamMoments": false}}}"#;
+        assert!(!character_control_settings(config, "navigator", base).team_moments);
+        assert!(character_control_settings(config, "patch", base).team_moments);
     }
 
     #[test]
