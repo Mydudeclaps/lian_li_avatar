@@ -215,3 +215,135 @@ Avoid: any change whatsoever outside the green backdrop; no new objects, particl
 ```
 
 Background-uniformity pass: Replaced the noisy chroma-green backdrop with a flat #00FF00 field while preserving the eight-pose sheet and keeping the bottom-row celebration pose free of star particles.
+
+## Patch team sheet v1
+
+Output file:
+
+```text
+art_sprint/patch-team-sheet-v1.png
+```
+
+Built-in image generation mode: identity-preserve edit
+
+Exact image prompt:
+
+```text
+Use case: identity-preserve
+Asset type: production chroma-green 4-column by 2-row team-animation pose sheet for the Lian Li Avatar / Patch LCD mascot project
+Input images: Image 1 and Image 2 are authoritative identity, outfit, proportions, palette, line-weight, shading, and polished illustration-style anchors for Patch. Do not edit the references and do not copy their black/transparent presentation or star effects.
+Primary request: Create a NEW exact equal-size 4-column by 2-row sprite pose sheet containing eight full-body poses of the same original character Patch. Each COLUMN is one two-frame team clip: row 1 is frame A and row 2 directly beneath it is frame B. Column order from left to right is huddle, toast, lookout, jig.
+
+CELL-BY-CELL POSE ORDER — MANDATORY:
+Top row, column 1 — HUDDLE A: Patch faces screen-LEFT, leaning forward toward the left, one hand pointing toward the lower-left as if at a map a crewmate holds just off-cell, focused curious expression. Do not show the map or crewmate.
+Bottom row, column 1 — HUDDLE B: same screen-left-facing leaning stance, but face lifted in a delighted grin; pointing hand remains extended toward lower-left. Do not show the map or crewmate.
+Top row, column 2 — TOAST A: Patch faces screen-LEFT, holding one plain wooden mug chest-high, angled toward the left.
+Bottom row, column 2 — TOAST B: Patch faces screen-LEFT, mug raised high toward the upper-left in a cheerful toast, head tilted back slightly.
+Top row, column 3 — LOOKOUT A: Patch faces screen-RIGHT, both hands raising one small plain brass spyglass to his eye, gazing right.
+Bottom row, column 3 — LOOKOUT B: Patch faces screen-RIGHT, spyglass slightly lowered but still held, wide excited eyes, big grin.
+Top row, column 4 — JIG A: front three-quarter view, mid dance step, both arms up, LEFT leg kicked out.
+Bottom row, column 4 — JIG B: front three-quarter view, opposite dance step, both arms up, RIGHT leg kicked out.
+
+Subject invariants: Preserve Patch's exact youthful chibi identity: warm tan skin, large brown eyes, tousled dark-brown hair, woven straw hat with rust-red/red band, teal scarf, navy long coat with gold trim, warm cream shirt, rust-red shorts, brown belt and pouch, brown boots, compact proportions, and friendly personality. Exactly one Patch in every cell. No redesign, costume substitutions, or missing signature items.
+Style/medium: Match the supplied references exactly: polished crisp 2D chibi game-sprite illustration, clean dark line weight, warm cel shading, subtle painted texture within the character only, compact readable proportions, transparent-ready edges.
+Composition/framing: Exact equal-size 4x2 invisible grid, exactly eight pose cells, exactly ONE complete full-body character per cell. Consistent character scale and standing baseline across all cells. Generous empty padding inside every cell on all sides. No body part, hat, scarf, mug, or spyglass may touch or cross a cell boundary or canvas edge. No overlap, bleed, neighboring fragments, cropping, duplication, or extra pose.
+Scene/backdrop: One perfectly flat, numerically uniform digital fill of exactly #00FF00, RGB (0,255,0), across the entire canvas, every cell, and every gap. Every background pixel must be identical. No tonal variation, noise, speckle, compression texture, gradients, shadows, contact shadows, floor plane, glow, effects, lighting variation, vignette, scenery, text, labels, logos, watermarks, borders, grid lines, or dividers.
+Props: Only the one plain wooden mug in each toast cell and the one small plain brass spyglass in each lookout cell. No visible map in huddle cells. No props in jig cells.
+Constraints: No #00FF00 anywhere inside Patch, clothing, hair, skin, props, outlines, or opaque cel shading. Natural hands, fingers, legs, and feet. Crisp fully contained transparent-ready silhouette in every cell.
+Avoid: wrong facing direction; swapped rows or columns; extra characters; extra props; map; crewmate; stars; particles; motion marks; text; cropped hat or boots; pose crossing a cell boundary; noisy or nonuniform green background.
+```
+
+First background-uniformity pass exact prompt:
+
+```text
+Use case: background-extraction
+Asset type: Lian Li Avatar / Patch LCD mascot chroma-green team-animation pose sheet
+Input images: Image 1 is the authoritative edit target and sole source of canvas layout, eight poses, content, edges, scale, positions, costume, props, expressions, facing directions, and colors. Image 2 is identity reference only; do not copy its pose or composition into Image 1.
+Primary request: Edit Image 1 conservatively. Change ONLY its existing green backdrop into one perfectly flat, numerically uniform digital fill of RGB (0,255,0), hexadecimal #00FF00, across the entire canvas and every gap between all eight sprite cells.
+Subject and composition invariants: Preserve all eight Patch characters exactly as they appear in Image 1: every pose, prop, edge, scale, position, outfit detail, facial expression, facing direction, line, and cel-shaded color. Preserve the exact canvas dimensions and exact 4-column by 2-row layout. Preserve column order huddle, toast, lookout, jig. Preserve top row as frame A and bottom row as frame B. Exactly one complete character per cell, with all generous padding intact.
+Required content to preserve: column 1 has two screen-left-facing pointing huddle poses with no visible map; column 2 has two screen-left-facing wooden-mug toast poses; column 3 has two screen-right-facing brass-spyglass lookout poses; column 4 has the two opposite-leg front three-quarter jig steps. Add nothing.
+Backdrop constraints: Every background pixel must be the identical solid color #00FF00, RGB 0 255 0. No lighting variation, noise, speckle, texture, vignette, gradient, shading, glow, shadow, floor plane, reflection, transparency, or compression artifacts.
+Edge constraints: Keep crisp, transparent-ready character and prop edges with no dark speckle, fringe, halo, erosion, expansion, redraw, or restyling. Do not use #00FF00 anywhere inside any character or prop.
+Avoid: any change whatsoever outside the green backdrop; no pose changes; no shifted limbs; no changed facing direction; no new objects, particles, text, watermark, border, divider, or decoration.
+```
+
+Second background-uniformity pass exact prompt:
+
+```text
+Use case: background-extraction
+Asset type: final numerical chroma-key correction for a Patch LCD mascot 4x2 pose sheet
+Input images: Image 1 is the sole authoritative edit target. It already has the correct exact eight characters, poses, props, directions, layout, dimensions, spacing, and edges. Do not redraw, move, resize, restyle, recolor, or reinterpret any subject pixel.
+Primary request: The previous background correction failed numerical uniformity. Replace ONLY the connected green background field and all green gaps with a single machine-flat digital fill whose every pixel is exactly RGB (0,255,0), hexadecimal #00FF00. This is a color-field correction only, not an illustration edit.
+Mandatory preservation: Preserve the exact canvas dimensions, exact 4-column by 2-row layout, and every Patch character and prop exactly pixel-for-pixel in appearance: all eight silhouettes, edges, positions, scales, expressions, facing directions, hands, legs, hat, scarf, coat, mug, and spyglass. Keep exactly one complete character in each cell and all existing padding.
+Numerical background requirement: Every background pixel across the full canvas and all inter-cell gaps must be identical #00FF00. Zero alternate green shades. Zero noise. Zero speckle. Zero gradients. Zero texture. Zero lighting variation. Zero vignette. Zero glow. Zero shadow. Zero floor. Zero transparency. Zero compression artifacts.
+Edge requirement: Preserve all crisp antialiased subject edges without erosion, expansion, halo, fringe, or recoloring. Do not put #00FF00 inside any opaque character or prop.
+Avoid: any subject change; any new content; any altered pose or direction; borders; dividers; text; labels; logos; watermark; effects. Output only the corrected sheet.
+```
+
+Background-uniformity result: Both built-in edit passes retained low-amplitude tonal variation, so the connected green-family backdrop was conservatively replaced with exact #00FF00 while preserving the character art.
+
+## Navigator team sheet v1
+
+Output file:
+
+```text
+art_sprint/navigator-team-sheet-v1.png
+```
+
+Built-in image generation mode: identity-preserve edit
+
+Exact image prompt:
+
+```text
+Use case: identity-preserve
+Asset type: production chroma-green 4-column by 2-row team-animation pose sheet for the Lian Li Avatar / Patch LCD mascot project
+Input images: Image 1 is the primary authoritative identity, outfit, proportions, palette, line-weight, shading, and polished sprite-style anchor for the navigator girl. Image 2 is a supporting close identity/style reference. Do not edit either reference and do not copy Image 1's existing pose order.
+Primary request: Create a NEW exact equal-size 4-column by 2-row sprite pose sheet containing eight full-body poses of the same original navigator girl. Each COLUMN is one two-frame team clip: row 1 is frame A and row 2 directly beneath it is frame B. Column order from left to right is huddle, toast, lookout, jig.
+
+CELL-BY-CELL POSE ORDER — MANDATORY:
+Top row, column 1 — HUDDLE A: navigator faces screen-RIGHT, holding her one unrolled parchment map open toward the right at chest height, studying it intently.
+Bottom row, column 1 — HUDDLE B: same screen-right-facing stance and same open map held toward the right, but she looks up from the map with a bright smile.
+Top row, column 2 — TOAST A: navigator faces screen-RIGHT, holding one plain wooden mug chest-high, angled toward the right.
+Bottom row, column 2 — TOAST B: navigator faces screen-RIGHT, mug raised high toward the upper-right in a cheerful toast.
+Top row, column 3 — LOOKOUT A: navigator faces and gazes screen-RIGHT, pointing forward-right with ONE fully extended arm while her other hand shades her eyes, thrilled expression. No spyglass.
+Bottom row, column 3 — LOOKOUT B: navigator faces and gazes screen-RIGHT, both empty fists raised in excitement, thrilled expression. No prop.
+Top row, column 4 — JIG A: front three-quarter view, mid dance step, both arms up, RIGHT leg kicked out.
+Bottom row, column 4 — JIG B: front three-quarter view, opposite dance step, both arms up, LEFT leg kicked out.
+
+Subject invariants: Preserve the navigator girl's exact identity from the references: youthful compact chibi girl; warm skin; large expressive brown eyes; auburn windswept high ponytail with a small side braid; loose forelock; layered seafaring outfit with orange and amber accents, warm cream fabric and trousers, short navy vest, brown belt and pouch, orange/navy split coat tails, deep brown boots. NO straw hat. NO teal scarf. Exactly one navigator girl in every cell. No redesign, costume substitutions, or missing signature identity features.
+Style/medium: Match the supplied references exactly: polished crisp 2D chibi game-sprite illustration, clean dark line weight, warm cel shading, subtle painted texture within the character only, compact readable proportions, transparent-ready edges.
+Composition/framing: Exact equal-size 4x2 invisible grid, exactly eight pose cells, exactly ONE complete full-body character per cell. Consistent character scale and standing baseline across all cells. Generous empty padding inside every cell on all sides. No body part, ponytail, map, or mug may touch or cross a cell boundary or canvas edge. No overlap, bleed, neighboring fragments, cropping, duplication, or extra pose.
+Scene/backdrop: One perfectly flat, numerically uniform digital fill of exactly #00FF00, RGB (0,255,0), across the entire canvas, every cell, and every gap. Every background pixel must be identical. No tonal variation, noise, speckle, compression texture, gradients, shadows, contact shadows, floor plane, glow, effects, lighting variation, vignette, scenery, text, labels, logos, watermarks, borders, grid lines, or dividers.
+Props: Only the one unrolled parchment map in each huddle cell and the one plain wooden mug in each toast cell. No props in lookout or jig cells. No compass. No rolled map. No spyglass.
+Constraints: No #00FF00 anywhere inside the navigator, clothing, hair, skin, props, outlines, or opaque cel shading. Natural hands, fingers, legs, and feet. Crisp fully contained transparent-ready silhouette in every cell.
+Avoid: wrong facing direction; swapped rows or columns; straw hat; teal scarf; extra characters; extra props; compass; rolled map; spyglass; stars; particles; motion marks; text; cropped ponytail or boots; pose crossing a cell boundary; noisy or nonuniform green background.
+```
+
+First background-uniformity pass exact prompt:
+
+```text
+Use case: background-extraction
+Asset type: Lian Li Avatar / Patch LCD mascot chroma-green team-animation pose sheet
+Input images: Image 1 is the authoritative edit target and sole source of canvas layout, eight poses, content, edges, scale, positions, costume, props, expressions, facing directions, and colors. Image 2 is identity reference only; do not copy its pose order or composition into Image 1.
+Primary request: Edit Image 1 conservatively. Change ONLY its existing green backdrop into one perfectly flat, numerically uniform digital fill of RGB (0,255,0), hexadecimal #00FF00, across the entire canvas and every gap between all eight sprite cells.
+Subject and composition invariants: Preserve all eight navigator girl characters exactly as they appear in Image 1: every pose, prop, edge, scale, position, outfit detail, facial expression, facing direction, line, and cel-shaded color. Preserve the exact canvas dimensions and exact 4-column by 2-row layout. Preserve column order huddle, toast, lookout, jig. Preserve top row as frame A and bottom row as frame B. Exactly one complete character per cell, with all generous padding intact. Preserve her auburn windswept ponytail and small side braid, orange/amber accents, warm cream fabric, navy vest, and deep brown boots. No straw hat and no teal scarf.
+Required content to preserve: column 1 has two screen-right-facing open-map huddle poses; column 2 has two screen-right-facing wooden-mug toast poses; column 3 has two screen-right-facing lookout poses, first pointing with other hand shading eyes and second with both empty fists raised; column 4 has the two opposite-leg front three-quarter jig steps. Add nothing.
+Backdrop constraints: Every background pixel must be the identical solid color #00FF00, RGB 0 255 0. No lighting variation, noise, speckle, texture, vignette, gradient, shading, glow, shadow, floor plane, reflection, transparency, or compression artifacts.
+Edge constraints: Keep crisp, transparent-ready character and prop edges with no dark speckle, fringe, halo, erosion, expansion, redraw, or restyling. Do not use #00FF00 anywhere inside any character or prop.
+Avoid: any change whatsoever outside the green backdrop; no pose changes; no shifted limbs; no changed facing direction; no new objects, particles, compass, rolled map, spyglass, text, watermark, border, divider, or decoration.
+```
+
+Second background-uniformity pass exact prompt:
+
+```text
+Use case: background-extraction
+Asset type: final numerical chroma-key correction for a navigator LCD mascot 4x2 pose sheet
+Input images: Image 1 is the sole authoritative edit target. It already has the correct exact eight characters, poses, props, directions, layout, dimensions, spacing, and edges. Do not redraw, move, resize, restyle, recolor, or reinterpret any subject pixel.
+Primary request: The previous background correction failed numerical uniformity. Replace ONLY the connected green background field and all green gaps with a single machine-flat digital fill whose every pixel is exactly RGB (0,255,0), hexadecimal #00FF00. This is a color-field correction only, not an illustration edit.
+Mandatory preservation: Preserve the exact canvas dimensions, exact 4-column by 2-row layout, and every navigator character and prop exactly pixel-for-pixel in appearance: all eight silhouettes, edges, positions, scales, expressions, facing directions, hands, legs, auburn ponytail and side braid, orange/amber and cream outfit, navy vest, boots, maps, and mugs. Keep exactly one complete character in each cell and all existing padding. No straw hat and no teal scarf.
+Numerical background requirement: Every background pixel across the full canvas and all inter-cell gaps must be identical #00FF00. Zero alternate green shades. Zero noise. Zero speckle. Zero gradients. Zero texture. Zero lighting variation. Zero vignette. Zero glow. Zero shadow. Zero floor. Zero transparency. Zero compression artifacts.
+Edge requirement: Preserve all crisp antialiased subject edges without erosion, expansion, halo, fringe, or recoloring. Do not put #00FF00 inside any opaque character or prop.
+Avoid: any subject change; any new content; any altered pose or direction; compass; rolled map; spyglass; borders; dividers; text; labels; logos; watermark; effects. Output only the corrected sheet.
+```
+
+Background-uniformity result: Both built-in edit passes retained low-amplitude tonal variation, so the connected green-family backdrop was conservatively replaced with exact #00FF00 while preserving the character art. The canvas was extended by two green pixels on the right and one on the bottom to 1776x888, yielding exact equal 444x444 cells without scaling or moving the character art.
