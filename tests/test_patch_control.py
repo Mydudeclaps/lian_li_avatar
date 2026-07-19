@@ -70,6 +70,7 @@ class PatchControlTests(unittest.TestCase):
                 "activityReactions": True,
                 "thermalReactions": False,
                 "characters": [],
+                "characterSettings": {},
             },
         )
         disk = json.loads(self.config_file.read_text(encoding="utf-8"))
@@ -92,6 +93,81 @@ class PatchControlTests(unittest.TestCase):
                 with self.assertRaises(PatchControlError):
                     self.control.update_settings(payload)
                 self.assertEqual(self.config_file.read_bytes(), before)
+
+    def test_character_settings_round_trip_and_merge_per_crewmate(self):
+        snapshot = self.control.update_settings(
+            {
+                "characterSettings": {
+                    "navigator": {
+                        "pace": "slow",
+                        "roamEnabled": False,
+                    }
+                }
+            }
+        )
+        self.assertEqual(
+            snapshot["settings"]["characterSettings"],
+            {"navigator": {"roamEnabled": False, "pace": "slow"}},
+        )
+        self.assertEqual(
+            json.loads(self.config_file.read_text(encoding="utf-8"))[
+                "character_settings"
+            ],
+            {"navigator": {"pace": "slow", "roam_enabled": False}},
+        )
+
+        snapshot = self.control.update_settings(
+            {"characterSettings": {"navigator": {"pace": "quick"}}}
+        )
+        self.assertEqual(
+            snapshot["settings"]["characterSettings"],
+            {"navigator": {"roamEnabled": False, "pace": "quick"}},
+        )
+
+    def test_empty_character_settings_section_clears_that_crewmate(self):
+        self.control.update_settings(
+            {"characterSettings": {"navigator": {"microIdles": False}}}
+        )
+        snapshot = self.control.update_settings(
+            {"characterSettings": {"navigator": {}}}
+        )
+        self.assertEqual(snapshot["settings"]["characterSettings"], {})
+        self.assertEqual(self.control.load_config()["character_settings"], {})
+
+    def test_invalid_character_settings_are_rejected_without_mutation(self):
+        self.control.update_settings(
+            {"characterSettings": {"navigator": {"pace": "slow"}}}
+        )
+        before = self.config_file.read_bytes()
+        payloads = (
+            {"characterSettings": {"patch": {"pace": "quick"}}},
+            {"characterSettings": {"stowaway": {"pace": "quick"}}},
+            {"characterSettings": {"navigator": {"unknown": True}}},
+            {"characterSettings": {"navigator": {"pace": "warp"}}},
+            {"characterSettings": {"navigator": {"roamEnabled": 1}}},
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaises(PatchControlError):
+                    self.control.update_settings(payload)
+                self.assertEqual(self.config_file.read_bytes(), before)
+
+    def test_invalid_disk_character_settings_use_safe_defaults(self):
+        self.config_file.parent.mkdir()
+        invalid_sections = (
+            [],
+            {"patch": {"pace": "slow"}},
+            {"stowaway": {"pace": "slow"}},
+            {"navigator": []},
+            {"navigator": {"unknown": True}},
+            {"navigator": {"pace": "warp"}},
+            {"navigator": {"thermal_reactions": 1}},
+        )
+        for section in invalid_sections:
+            with self.subTest(section=section):
+                config = {**DEFAULT_CONFIG, "character_settings": section}
+                self.config_file.write_text(json.dumps(config), encoding="utf-8")
+                self.assertEqual(self.control.load_config(), DEFAULT_CONFIG)
 
     def queued_commands(self):
         return self.control._queued_command_files()
@@ -330,6 +406,7 @@ class PatchControlTests(unittest.TestCase):
                 "activityReactions",
                 "thermalReactions",
                 "characters",
+                "characterSettings",
             },
         )
         self.assertEqual(set(snapshot["service"]), {"active", "status"})

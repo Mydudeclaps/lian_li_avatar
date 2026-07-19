@@ -22,8 +22,14 @@ either clips sprites at the edge columns or collapses back onto the
 shared points, and the reservation covers the conflicts the offsets were
 meant to prevent.
 
-Not yet implemented from this design: per-character settings sections and
-dropping the v1 compatibility output behind a config flag.
+Per-character settings ship as `character_settings` sections in
+mascot-control.json (API key `characterSettings`): a crewmate section holds
+a subset of the global setting keys and overrides only those; absent keys
+inherit live. The default character has no section — the top-level settings
+are his.
+
+Not yet implemented from this design: dropping the v1 compatibility output
+behind a config flag.
 
 ## Goal
 

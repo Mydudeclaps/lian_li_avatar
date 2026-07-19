@@ -61,16 +61,21 @@ DEFAULT_CONFIG = {
     "activity_reactions": True,
     "thermal_reactions": True,
     "characters": [],
+    "character_settings": {},
 }
 
-PUBLIC_TO_DISK = {
+CHARACTER_PUBLIC_TO_DISK = {
     "roamEnabled": "roam_enabled",
     "pattern": "roam_pattern",
     "pace": "pace",
     "microIdles": "micro_idles",
     "activityReactions": "activity_reactions",
     "thermalReactions": "thermal_reactions",
+}
+PUBLIC_TO_DISK = {
+    **CHARACTER_PUBLIC_TO_DISK,
     "characters": "characters",
+    "characterSettings": "character_settings",
 }
 
 KNOWN_STATES = {
@@ -125,6 +130,66 @@ HOME_POINT = (1144, 720)
 
 class PatchControlError(ValueError):
     """A safe client-facing validation error."""
+
+
+def _validate_disk_setting(key: str, value: object) -> None:
+    if key in {
+        "roam_enabled",
+        "micro_idles",
+        "activity_reactions",
+        "thermal_reactions",
+    }:
+        if type(value) is not bool:
+            raise PatchControlError(f"{key} must be a boolean")
+    elif key == "roam_pattern":
+        if value not in PATTERNS:
+            raise PatchControlError(
+                "roam_pattern must be full, horizontal, or vertical"
+            )
+    elif key == "pace" and value not in PACES:
+        raise PatchControlError("pace must be slow, normal, or quick")
+
+
+def _validate_character_settings(value: object) -> dict:
+    if not isinstance(value, dict):
+        raise PatchControlError("character_settings must be an object")
+    clean = {}
+    allowed = set(CHARACTER_PUBLIC_TO_DISK.values())
+    for character, settings in value.items():
+        if character not in OPTIONAL_CHARACTERS:
+            raise PatchControlError("Unknown mascot character in character_settings")
+        if not isinstance(settings, dict):
+            raise PatchControlError("Each character_settings value must be an object")
+        unknown = set(settings) - allowed
+        if unknown:
+            raise PatchControlError(
+                f"Unknown character setting: {next(iter(unknown))}"
+            )
+        for key, setting in settings.items():
+            _validate_disk_setting(key, setting)
+        clean[character] = dict(settings)
+    return clean
+
+
+def _character_settings_to_disk(value: object) -> dict:
+    if not isinstance(value, dict):
+        raise PatchControlError("characterSettings must be an object")
+    disk_sections = {}
+    for character, settings in value.items():
+        if character not in OPTIONAL_CHARACTERS:
+            raise PatchControlError("Unknown mascot character in characterSettings")
+        if not isinstance(settings, dict):
+            raise PatchControlError("Each characterSettings value must be an object")
+        unknown = set(settings) - set(CHARACTER_PUBLIC_TO_DISK)
+        if unknown:
+            raise PatchControlError(
+                f"Unknown character setting: {next(iter(unknown))}"
+            )
+        disk_sections[character] = {
+            CHARACTER_PUBLIC_TO_DISK[public]: setting
+            for public, setting in settings.items()
+        }
+    return _validate_character_settings(disk_sections)
 
 
 def _trusted_runtime_dir() -> Path:
@@ -190,18 +255,15 @@ def _validate_config(value: object) -> dict:
         raise PatchControlError("Unsupported mascot configuration version")
     if value.get("mode") not in {"auto", "manual"}:
         raise PatchControlError("mode must be auto or manual")
-    if value.get("roam_pattern") not in PATTERNS:
-        raise PatchControlError("roam_pattern must be full, horizontal, or vertical")
-    if value.get("pace") not in PACES:
-        raise PatchControlError("pace must be slow, normal, or quick")
     for key in (
+        "roam_pattern",
+        "pace",
         "roam_enabled",
         "micro_idles",
         "activity_reactions",
         "thermal_reactions",
     ):
-        if type(value.get(key)) is not bool:
-            raise PatchControlError(f"{key} must be a boolean")
+        _validate_disk_setting(key, value.get(key))
     characters = value.get("characters")
     if (
         not isinstance(characters, list)
@@ -209,14 +271,28 @@ def _validate_config(value: object) -> dict:
         or any(character not in OPTIONAL_CHARACTERS for character in characters)
     ):
         raise PatchControlError("characters must be a list of known crewmates")
-    return dict(value)
+    clean = dict(value)
+    clean["character_settings"] = _validate_character_settings(
+        value.get("character_settings")
+    )
+    return clean
 
 
 def _public_settings(config: dict) -> dict:
-    return {
+    settings = {
         public: config[disk]
         for public, disk in PUBLIC_TO_DISK.items()
+        if public != "characterSettings"
     }
+    settings["characterSettings"] = {
+        character: {
+            public: overrides[disk]
+            for public, disk in CHARACTER_PUBLIC_TO_DISK.items()
+            if disk in overrides
+        }
+        for character, overrides in config["character_settings"].items()
+    }
+    return settings
 
 
 class PatchControl:
@@ -280,18 +356,8 @@ class PatchControl:
             config = self.load_config()
             for public, value in changes.items():
                 disk = PUBLIC_TO_DISK[public]
-                if public in {
-                    "roamEnabled",
-                    "microIdles",
-                    "activityReactions",
-                    "thermalReactions",
-                }:
-                    if type(value) is not bool:
-                        raise PatchControlError(f"{public} must be a boolean")
-                elif public == "pattern" and value not in PATTERNS:
-                    raise PatchControlError("pattern must be full, horizontal, or vertical")
-                elif public == "pace" and value not in PACES:
-                    raise PatchControlError("pace must be slow, normal, or quick")
+                if public in CHARACTER_PUBLIC_TO_DISK:
+                    _validate_disk_setting(disk, value)
                 elif public == "characters" and (
                     not isinstance(value, list)
                     or len(set(value)) != len(value)
@@ -303,6 +369,18 @@ class PatchControl:
                     raise PatchControlError(
                         "characters must be a list of known crewmates"
                     )
+                elif public == "characterSettings":
+                    merged = {
+                        character: dict(overrides)
+                        for character, overrides in config[disk].items()
+                    }
+                    disk_sections = _character_settings_to_disk(value)
+                    for character, overrides in disk_sections.items():
+                        if overrides:
+                            merged.setdefault(character, {}).update(overrides)
+                        else:
+                            merged.pop(character, None)
+                    value = merged
                 config[disk] = value
             self._save_config(config)
         return self.snapshot()

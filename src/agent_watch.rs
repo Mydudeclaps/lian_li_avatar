@@ -782,6 +782,63 @@ fn parse_control_settings(value: &str) -> ControlSettings {
     settings
 }
 
+/// The flat settings object for one crewmate inside `character_settings`.
+/// The search is scoped to the section's own braces so a character id
+/// appearing elsewhere (for example in the `characters` roster list) can
+/// never satisfy or poison the lookup.
+fn character_settings_fragment<'a>(config: &'a str, id: &str) -> Option<&'a str> {
+    let section = json_value_after_key(config, "character_settings")?.strip_prefix('{')?;
+    let mut depth = 1usize;
+    let mut end = None;
+    for (index, byte) in section.bytes().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(index);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let scoped = &section[..end?];
+    let fragment = json_value_after_key(scoped, id)?.strip_prefix('{')?;
+    let close = fragment.find('}')?;
+    Some(&fragment[..close])
+}
+
+/// Global settings overridden by one crewmate's `character_settings`
+/// section. Absent keys inherit; the parser stays as lenient as the global
+/// one, so junk values fall back rather than wedge the watcher.
+fn character_control_settings(config: &str, id: &str, base: ControlSettings) -> ControlSettings {
+    let Some(fragment) = character_settings_fragment(config, id) else {
+        return base;
+    };
+    let mut settings = base;
+    settings.roam_enabled = json_bool(fragment, "roamEnabled")
+        .or_else(|| json_bool(fragment, "roam_enabled"))
+        .unwrap_or(settings.roam_enabled);
+    settings.micro_idles = json_bool(fragment, "microIdles")
+        .or_else(|| json_bool(fragment, "micro_idles"))
+        .unwrap_or(settings.micro_idles);
+    settings.activity_reactions = json_bool(fragment, "activityReactions")
+        .or_else(|| json_bool(fragment, "activity_reactions"))
+        .unwrap_or(settings.activity_reactions);
+    settings.thermal_reactions = json_bool(fragment, "thermalReactions")
+        .or_else(|| json_bool(fragment, "thermal_reactions"))
+        .unwrap_or(settings.thermal_reactions);
+    settings.pattern = json_string(fragment, "pattern")
+        .or_else(|| json_string(fragment, "roam_pattern"))
+        .and_then(RoamPattern::parse)
+        .unwrap_or(settings.pattern);
+    settings.pace = json_string(fragment, "pace")
+        .and_then(RoamPace::parse)
+        .unwrap_or(settings.pace);
+    settings
+}
+
 fn control_config_path() -> Option<PathBuf> {
     let home = PathBuf::from(env::var_os("HOME")?);
     home.is_absolute()
@@ -2363,6 +2420,14 @@ fn main() -> io::Result<()> {
         eprintln!("Roster: {} enabled", spec.id);
     }
 
+    // Effective settings per roster slot: the global settings overridden by
+    // that crewmate's character_settings section. Recomputed with every
+    // control-config sample.
+    let mut per_character_settings: Vec<ControlSettings> = characters
+        .iter()
+        .map(|character| character_control_settings(&initial_config, character.id, control_settings))
+        .collect();
+
     let mut mask = 0u8;
     let mut next_process_sample = Instant::now();
     let mut next_thermal_sample = Instant::now();
@@ -2472,7 +2537,13 @@ fn main() -> io::Result<()> {
         let now_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         if cycle_started >= next_control_sample {
             next_control_sample = cycle_started + CONTROL_INTERVAL;
-            control_settings = read_control_settings(control_config_path.as_deref(), uid);
+            let config_text =
+                read_trusted_config(control_config_path.as_deref(), uid).unwrap_or_default();
+            control_settings = parse_control_settings(&config_text);
+            for (index, character) in characters.iter().enumerate() {
+                per_character_settings[index] =
+                    character_control_settings(&config_text, character.id, control_settings);
+            }
         }
         let controls = consume_control_commands(&runtime_dir, uid, now_unix_ms);
         let mut events = Vec::with_capacity(2);
@@ -2514,7 +2585,7 @@ fn main() -> io::Result<()> {
                 })
                 .map(|(_, command)| *command)
                 .collect();
-            let mut settings = control_settings;
+            let mut settings = per_character_settings[index];
             settings.thermal_reactions =
                 settings.thermal_reactions && character.thermal_reactions;
 
@@ -2857,6 +2928,46 @@ mod tests {
         assert!(parse_enabled_characters(r#"{"mode":"auto"}"#).is_empty());
         assert!(parse_enabled_characters(r#"{"characters":"navigator"}"#).is_empty());
         assert!(parse_enabled_characters(r#"{"characters":["navigator""#).is_empty());
+    }
+
+    #[test]
+    fn character_settings_sections_override_and_inherit() {
+        let config = r#"{
+            "mode": "auto",
+            "pace": "quick",
+            "roam_pattern": "full",
+            "micro_idles": true,
+            "character_settings": {
+                "navigator": {"pace": "slow", "roam_pattern": "horizontal"}
+            },
+            "characters": ["navigator"]
+        }"#;
+        let base = parse_control_settings(config);
+        assert_eq!(base.pace, RoamPace::Quick);
+
+        let navigator = character_control_settings(config, "navigator", base);
+        assert_eq!(navigator.pace, RoamPace::Slow);
+        assert_eq!(navigator.pattern, RoamPattern::Horizontal);
+        // Absent keys inherit the global values.
+        assert!(navigator.micro_idles);
+
+        // No section for this id: everything inherits.
+        let patch = character_control_settings(config, "patch", base);
+        assert_eq!(patch.pace, RoamPace::Quick);
+        assert_eq!(patch.pattern, RoamPattern::Full);
+
+        // The id appearing only in the roster list must not read the other
+        // crewmate's section, and junk values fall back to the base.
+        let scoped = r#"{
+            "character_settings": {"doctor": {"pace": "slow"}},
+            "characters": ["navigator", "doctor"]
+        }"#;
+        let navigator = character_control_settings(scoped, "navigator", base);
+        assert_eq!(navigator.pace, RoamPace::Quick);
+        let junk = r#"{"character_settings": {"navigator": {"pace": "warp"}}}"#;
+        let fallback = character_control_settings(junk, "navigator", base);
+        assert_eq!(fallback.pace, RoamPace::Quick);
+        assert!(character_settings_fragment(r#"{"characters": ["navigator"]}"#, "navigator").is_none());
     }
 
     #[test]
