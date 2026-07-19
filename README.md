@@ -16,7 +16,7 @@ running on the original machine.
   tool/read, success/error, thermal, and left/right walking states.
 - Corrected six-frame walking art, v3 pose sheets, and the deterministic
   ImageMagick/FFmpeg animation builder.
-- Standalone Rust event writer and watcher with 32 inline tests.
+- Standalone Rust event writer and watcher with 40 inline tests.
 - Codex and Claude Code hook templates that emit only allowlisted lifecycle
   events and discard hook input.
 - Full 3×3 movement, horizontal/vertical/full roaming patterns, three speeds,
@@ -137,6 +137,31 @@ Then open `http://127.0.0.1:7071`. The server is deliberately loopback-only.
 Its Python bridge can also be embedded into an existing local dashboard; the
 API contract is covered by the tests under `tests/`.
 
+## Optional: official agent icons (local only)
+
+The agent-identity states ship with abstract cyan/amber accents. If you want
+the real Codex and Claude marks on your own machine, obtain the official art
+yourself and install it as:
+
+```text
+~/.config/lianli/brand/codex.png            (mark on a dark tile)
+~/.config/lianli/brand/clawd.png            (preferred over claude.png)
+~/.config/lianli/brand/claude.png
+```
+
+`./scripts/build_animations.sh` then integrates the marks into the artwork
+of the six `codex-`/`claude-`/`both-` active and wait states rather than
+floating them as badges: the two panels juggled in the dual pose become
+brand cards, the holographic laptop screen shows the Codex mark as screen
+content, and the reading scroll carries the Claude mark as a small stamp.
+Branded frames are written to the gitignored
+`assets/mascot/animations-branded/`, and `./scripts/install.sh` prefers that
+directory when it exists. Official marks are trademarks of their owners:
+they are never distributed with this repository, branded builds never
+overwrite the tracked assets, and this project remains unaffiliated with
+OpenAI and Anthropic. Override the icon directory with
+`LIANLI_BRAND_ICON_DIR`.
+
 ## Animation development
 
 Rebuild every v3 animation from the checked-in poses:
@@ -158,7 +183,7 @@ make test
 make test-assets
 ```
 
-`make test` runs 32 Rust tests, the Python control/HTTP tests, JSON rendering,
+`make test` runs 40 Rust tests, the Python control/HTTP tests, JSON rendering,
 shell syntax checks, and a scan for machine-specific paths and identifiers.
 
 ## Attribution

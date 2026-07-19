@@ -35,6 +35,14 @@ install -d -m 755 -- \
   "$bin_root" \
   "$config_home/systemd/user"
 cp -a -- "$repo_root/assets/mascot/." "$asset_root/mascot/"
+# Locally branded animations (official agent icons composited by
+# build_animations.sh; never committed) take precedence when present.
+rm -rf -- "$asset_root/mascot/animations-branded"
+branded_animations="$repo_root/assets/mascot/animations-branded"
+if [[ -d "$branded_animations" ]]; then
+  echo "Installing locally branded animations from $branded_animations"
+  cp -a -- "$branded_animations/." "$asset_root/mascot/animations/"
+fi
 install -m 644 -- "$repo_root/assets/display/panels.png" "$asset_root/display/panels.png"
 install -m 755 -- "$repo_root/scripts/lianli-mascot" "$bin_root/lianli-mascot"
 install -m 644 -- \

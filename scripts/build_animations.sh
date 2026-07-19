@@ -13,6 +13,125 @@ width=600
 height=400
 delay_cs=10
 
+# --- optional local brand art ----------------------------------------------
+# Official Codex/Claude marks are trademarks and are never distributed with
+# this repository. If PNG art exists in "$LIANLI_BRAND_ICON_DIR" (default
+# ~/.config/lianli/brand) as codex.png (mark on a dark tile) and clawd.png
+# or claude.png, the agent-identity states render from pre-composited pose
+# variants: the two juggled panels in the dual pose become brand cards, the
+# holographic laptop screen shows the Codex mark, and the reading scroll
+# carries the Claude mark as a small stamp. Branded output goes to the
+# gitignored animations-branded/ directory so trademarked frames can never
+# enter version control; without brand art the public build is byte-for-byte
+# unaffected.
+brand_dir="${LIANLI_BRAND_ICON_DIR:-$HOME/.config/lianli/brand}"
+
+claude_mark_file() {
+  if [[ -f "$brand_dir/clawd.png" ]]; then
+    printf '%s' "$brand_dir/clawd.png"
+  elif [[ -f "$brand_dir/claude.png" ]]; then
+    printf '%s' "$brand_dir/claude.png"
+  else
+    return 1
+  fi
+}
+
+branding_active() {
+  [[ -f "$brand_dir/codex.png" ]] || claude_mark_file >/dev/null
+}
+
+if branding_active; then
+  animations="$root/animations-branded"
+  echo "Local brand art found in $brand_dir; writing to $animations"
+fi
+
+# Overlay one image on a pose, centered at (cx, cy), rotated by rot degrees.
+# Marks stay inside the pose's existing content bounds so the -trim geometry
+# in render_asset (and therefore every frame position) is unchanged.
+place_mark() {
+  local base="$1" overlay="$2" cx="$3" cy="$4" rot="$5" out="$6"
+  local rotated="$work/brand-rotated.png"
+  magick "$overlay" -background none -rotate "$rot" "PNG32:$rotated"
+  local rw rh
+  read -r rw rh < <(magick identify -format '%w %h\n' "$rotated")
+  magick "$base" "$rotated" -gravity northwest \
+    -geometry "+$((cx - rw / 2))+$((cy - rh / 2))" -compose over -composite \
+    "PNG32:$out"
+}
+
+# A rounded card holding one centered mark, in the juggled-panel style.
+brand_card() {
+  local w="$1" h="$2" border="$3" interior="$4" mark="$5" markw="$6" filter="$7" out="$8"
+  magick -size "${w}x${h}" xc:none \
+    -fill "$interior" -stroke "$border" -strokewidth 4 \
+    -draw "roundrectangle 3,3 $((w - 4)),$((h - 4)) 9,9" \
+    \( "$mark" -filter "$filter" -resize "${markw}x${markw}" \) \
+    -gravity center -compose over -composite "PNG32:$out"
+}
+
+# Build branded variants of the poses that carry agent artifacts. Each mark
+# degrades independently: a missing icon leaves that element untouched.
+prepare_branded_poses() {
+  local blossom="$work/brand-blossom.png"
+  local have_codex=false
+  if [[ -f "$brand_dir/codex.png" ]]; then
+    have_codex=true
+    # White mark with luminance-derived alpha, freed from its dark tile.
+    magick "$brand_dir/codex.png" -resize 300x300 \
+      \( +clone -colorspace gray -level 12%,85% \) \
+      -alpha off -compose CopyOpacity -composite "PNG32:$blossom"
+  fi
+  local claude_mark="" claude_filter=triangle claude_is_clawd=false
+  if claude_mark_file >/dev/null; then
+    claude_mark="$(claude_mark_file)"
+    if [[ "$(basename "$claude_mark")" == "clawd.png" ]]; then
+      # Pixel art: nearest-neighbor scaling, plus a soft offset shadow.
+      claude_filter=point
+      claude_is_clawd=true
+    fi
+  fi
+
+  # dual: both juggled boxes become brand cards.
+  local dual_in="$legacy/dual.png" dual_out="$work/branded-pose-dual.png"
+  if $have_codex; then
+    brand_card 66 92 '#63e6ff' '#0d3a42f0' "$blossom" 44 triangle "$work/brand-card-cyan.png"
+    place_mark "$dual_in" "$work/brand-card-cyan.png" 29 70 -12 "$dual_out"
+    dual_in="$dual_out"
+  fi
+  if [[ -n "$claude_mark" ]]; then
+    brand_card 70 72 '#ffd54a' '#3a2a0cf0' "$claude_mark" 60 "$claude_filter" "$work/brand-card-amber.png"
+    place_mark "$dual_in" "$work/brand-card-amber.png" 236 93 8 "$dual_out"
+  fi
+
+  # typing: the holographic laptop screen shows the Codex mark as content.
+  if $have_codex; then
+    magick "$blossom" -fill '#0b4a55' -colorize 100 -resize 54x54 \
+      "PNG32:$work/brand-blossom-screen.png"
+    place_mark "$legacy/typing.png" "$work/brand-blossom-screen.png" 247 244 -8 \
+      "$work/branded-pose-typing.png"
+  fi
+
+  # reading: the scroll carries the Claude mark as a small stamp.
+  if [[ -n "$claude_mark" ]]; then
+    local reading_in="$legacy/reading.png"
+    magick "$claude_mark" -filter "$claude_filter" -resize '54x54' \
+      "PNG32:$work/brand-stamp.png"
+    if $claude_is_clawd; then
+      magick "$work/brand-stamp.png" -channel RGB -fill '#6b3416' -colorize 100 \
+        +channel "PNG32:$work/brand-stamp-shadow.png"
+      place_mark "$reading_in" "$work/brand-stamp-shadow.png" 214 273 3 \
+        "$work/branded-pose-reading.png"
+      reading_in="$work/branded-pose-reading.png"
+    fi
+    place_mark "$reading_in" "$work/brand-stamp.png" 212 271 3 \
+      "$work/branded-pose-reading.png"
+  fi
+}
+
+if branding_active; then
+  prepare_branded_poses
+fi
+
 mkdir -p "$animations"
 
 frame_path() {
@@ -49,7 +168,11 @@ render_asset() {
 render_legacy() {
   local name="$1"
   shift
-  render_asset "$legacy/$name.png" "$@"
+  local file="$legacy/$name.png"
+  if [[ -f "$work/branded-pose-$name.png" ]]; then
+    file="$work/branded-pose-$name.png"
+  fi
+  render_asset "$file" "$@"
 }
 
 render_pose() {
@@ -189,24 +312,21 @@ make_legacy_loop() {
     if ((i == 5 || i == 11)); then
       x=3
     fi
+    local -a marks=()
     case "$accent" in
       cyan)
-        render_legacy "$pose" "$target_height" "$x" "$bob" false "$(frame_path "$dir" "$i")" \
-          -fill '#63e6ff' -draw "rectangle 92,74 99,84 rectangle 493,111 501,122"
+        marks=(-fill '#63e6ff' -draw "rectangle 92,74 99,84 rectangle 493,111 501,122")
         ;;
       amber)
-        render_legacy "$pose" "$target_height" "$x" "$bob" false "$(frame_path "$dir" "$i")" \
-          -fill '#ffbf5b' -draw "circle 95,109 99,109 circle 500,78 504,78"
+        marks=(-fill '#ffbf5b' -draw "circle 95,109 99,109 circle 500,78 504,78")
         ;;
       dual)
-        render_legacy "$pose" "$target_height" "$x" "$bob" false "$(frame_path "$dir" "$i")" \
-          -fill '#63e6ff' -draw "rectangle 84,92 91,103" \
-          -fill '#ffbf5b' -draw "circle 507,104 512,104"
-        ;;
-      *)
-        render_legacy "$pose" "$target_height" "$x" "$bob" false "$(frame_path "$dir" "$i")"
+        marks=(-fill '#63e6ff' -draw "rectangle 84,92 91,103"
+               -fill '#ffbf5b' -draw "circle 507,104 512,104")
         ;;
     esac
+    render_legacy "$pose" "$target_height" "$x" "$bob" false "$(frame_path "$dir" "$i")" \
+      "${marks[@]}"
   done
   encode_apng "$dir" "$animations/patch-$output_name-v3.png"
   validate_asset "$animations/patch-$output_name-v3.png" "$frames"

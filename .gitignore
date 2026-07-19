@@ -8,6 +8,10 @@ __pycache__/
 /target/
 /generated/
 
+# Locally branded animations may contain third-party trademarks (official
+# agent icons) and must never be committed.
+/assets/mascot/animations-branded/
+
 # These belong to the running machine, never the repository.
 lianli-agent-state
 lianli-agent-position
