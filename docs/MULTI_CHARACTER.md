@@ -1,8 +1,20 @@
-# Multi-character design (v2 protocol) — DRAFT for review
+# Multi-character design (v2 protocol)
 
-Status: proposal. Nothing in this document is implemented yet; the current
-code still runs the single-character v1 contract described in
-[ARCHITECTURE.md](ARCHITECTURE.md).
+Status: migration steps 1–2 are implemented. The watcher drives a roster of
+per-character engines, writes character-suffixed state/position/control-status
+files alongside the un-suffixed v1 files for `patch`, accepts v2 five-field
+commands (`v1 <ms> <character|-> <command> <argument>`), and routes events by
+actor mask. The control bridge takes an optional allowlisted `character`
+field and reports per-character status in its snapshot. The `navigator`
+roster entry (Codex-routed, thermal reactions off, home lower-left) is
+enabled by listing her in the `characters` array of mascot-control.json, and
+her v1 animation set builds from `assets/mascot/poses-navigator/`; see
+`config/navigator-widget.example.json.in` for her template widget.
+
+Not yet implemented from this design: per-character settings sections, the
+offset waypoint grids and roam reservation (separation today is distinct
+home anchors only), the dashboard's multi-character cards, and dropping the
+v1 compatibility output behind a config flag.
 
 ## Goal
 

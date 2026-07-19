@@ -39,6 +39,15 @@ Event records contain no prompt or tool payload:
 v1 <created-unix-ms> <start|exit|tool|read|permission|error|success> <ttl-ms>
 ```
 
+The watcher drives a roster of characters (`patch` plus any crewmates
+enabled in the `characters` config list), each with its own state engine and
+character-suffixed output files (`lianli-agent-state-<id>` and friends).
+Events route to every character whose actor mask includes the emitting
+agent; commands address one character via the optional v2 field
+(`v1 <ms> <character|-> <command> <argument>`), with four-field v1 records
+resolving to `patch`, which also keeps writing the un-suffixed v1 files
+until templates are migrated.
+
 Event and control records are published as one file per record —
 `<name>.<20-digit zero-padded created-ms>.<pid>` — so bursts inside one
 100 ms watcher tick cannot overwrite each other. Publication is

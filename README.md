@@ -127,6 +127,17 @@ lianli-mascot move home 1200
 Forcing a state or destination with this CLI stops automatic detection;
 `lianli-mascot auto` returns control to the watcher.
 
+## Optional: the navigator (character 2)
+
+A second crewmate — a Codex-routed navigator who idles at the lower left —
+ships as keyed poses and a v1 animation set. Enable her by adding
+`"characters": ["navigator"]` to `mascot-control.json`, restarting
+`lianli-agent-watch.service`, and merging the rendered
+`config/navigator-widget.example.json.in` widget into your template. The
+control bridge then accepts `"character": "navigator"` on commands and
+reports her alongside Patch in its snapshot. Without her roster entry the
+system behaves exactly as the single-character release.
+
 Run the focused touch control page with:
 
 ```bash

@@ -788,24 +788,65 @@ fn control_config_path() -> Option<PathBuf> {
         .then(|| home.join(".config/lianli/mascot-control.json"))
 }
 
-fn read_control_settings(path: Option<&Path>, uid: u32) -> ControlSettings {
-    let Some(path) = path else {
-        return ControlSettings::default();
-    };
-    let Some(metadata) = fs::symlink_metadata(path).ok() else {
-        return ControlSettings::default();
-    };
+fn read_trusted_config(path: Option<&Path>, uid: u32) -> Option<String> {
+    let path = path?;
+    let metadata = fs::symlink_metadata(path).ok()?;
     if !metadata.file_type().is_file()
         || metadata.uid() != uid
         || metadata.len() > 4_096
         || metadata.mode() & 0o077 != 0
     {
-        return ControlSettings::default();
+        return None;
     }
-    fs::read_to_string(path)
-        .ok()
+    fs::read_to_string(path).ok()
+}
+
+fn read_control_settings(path: Option<&Path>, uid: u32) -> ControlSettings {
+    read_trusted_config(path, uid)
         .map(|value| parse_control_settings(&value))
         .unwrap_or_default()
+}
+
+/// A character the watcher can drive. `patch` is always on the roster; the
+/// optional crew below is enabled by listing ids in the `characters` array
+/// of mascot-control.json. Routing is configuration, not code: an absent
+/// crewmate leaves the single-character system exactly as it was.
+struct CharacterSpec {
+    id: &'static str,
+    actor_mask: u8,
+    thermal_reactions: bool,
+    home: ScreenLocation,
+}
+
+const DEFAULT_CHARACTER: &str = "patch";
+
+const OPTIONAL_CHARACTERS: &[CharacterSpec] = &[CharacterSpec {
+    id: "navigator",
+    actor_mask: CODEX,
+    thermal_reactions: false,
+    home: ScreenLocation::LowerLeft,
+}];
+
+fn parse_enabled_characters(config: &str) -> Vec<&'static CharacterSpec> {
+    let mut enabled: Vec<&'static CharacterSpec> = Vec::new();
+    let Some(after) = json_value_after_key(config, "characters") else {
+        return enabled;
+    };
+    let Some(list) = after.strip_prefix('[') else {
+        return enabled;
+    };
+    let Some(end) = list.find(']') else {
+        return enabled;
+    };
+    for token in list[..end].split(',') {
+        let id = token.trim().trim_matches('"');
+        if let Some(spec) = OPTIONAL_CHARACTERS.iter().find(|spec| spec.id == id) {
+            if !enabled.iter().any(|existing| existing.id == spec.id) {
+                enabled.push(spec);
+            }
+        }
+    }
+    enabled
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -845,7 +886,23 @@ enum ControlCommand {
     Preview(PreviewKind),
 }
 
-fn parse_control_record(bytes: &[u8], now_unix_ms: u64) -> Option<(u64, ControlCommand)> {
+/// Character ids on the wire: lowercase, `[a-z][a-z0-9-]{0,15}`.
+fn valid_character_id(id: &str) -> bool {
+    let mut bytes = id.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    id.len() <= 16
+        && first.is_ascii_lowercase()
+        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// A parsed command with the character it addresses. `None` targets the
+/// default character (`patch`), which is what every v1 four-field record
+/// resolves to.
+type RoutedCommand = (Option<String>, ControlCommand);
+
+fn parse_control_record(bytes: &[u8], now_unix_ms: u64) -> Option<(u64, RoutedCommand)> {
     if bytes.len() as u64 > MAX_CONTROL_RECORD_BYTES {
         return None;
     }
@@ -855,8 +912,21 @@ fn parse_control_record(bytes: &[u8], now_unix_ms: u64) -> Option<(u64, ControlC
         return None;
     }
     let created_ms = fields.next()?.parse::<u64>().ok()?;
-    let command = fields.next()?;
-    let argument = fields.next()?;
+    // v1 records are `v1 <ms> <command> <argument>`; v2 inserts a character
+    // field before the command: `v1 <ms> <character|-> <command> <argument>`.
+    let third = fields.next()?;
+    let fourth = fields.next()?;
+    let (target, command, argument) = match fields.next() {
+        None => (None, third, fourth),
+        Some(fifth) => {
+            let target = match third {
+                "-" => None,
+                id if valid_character_id(id) => Some(id.to_string()),
+                _ => return None,
+            };
+            (target, fourth, fifth)
+        }
+    };
     if fields.next().is_some()
         || created_ms > now_unix_ms.saturating_add(MAX_EVENT_FUTURE_SKEW_MS)
         || now_unix_ms.saturating_sub(created_ms) > MAX_CONTROL_AGE_MS
@@ -870,14 +940,14 @@ fn parse_control_record(bytes: &[u8], now_unix_ms: u64) -> Option<(u64, ControlC
         "preview" => ControlCommand::Preview(PreviewKind::parse(argument)?),
         _ => return None,
     };
-    Some((created_ms, command))
+    Some((created_ms, (target, command)))
 }
 
-fn consume_control_commands(runtime_dir: &Path, uid: u32, now_unix_ms: u64) -> Vec<ControlCommand> {
+fn consume_control_commands(runtime_dir: &Path, uid: u32, now_unix_ms: u64) -> Vec<RoutedCommand> {
     // Bridges older than the queue format still use one fixed mailbox file.
     let legacy_source = runtime_dir.join("lianli-agent-command");
     let legacy_claim = runtime_dir.join(format!(".lianli-agent-command.watch-{}", process::id()));
-    let mut stamped: Vec<(u64, ControlCommand)> = claim_record(
+    let mut stamped: Vec<(u64, RoutedCommand)> = claim_record(
         &legacy_source,
         &legacy_claim,
         uid,
@@ -1452,6 +1522,7 @@ struct StateEngine {
     last_micro_index: Option<usize>,
     position: Point,
     anchor: Waypoint,
+    home: ScreenLocation,
     interrupted_edge: Option<(Waypoint, Waypoint)>,
     manual_location: Option<ScreenLocation>,
     manual_motion: Option<Motion>,
@@ -1478,6 +1549,7 @@ impl StateEngine {
             last_micro_index: None,
             position: Waypoint::Home.point(),
             anchor: Waypoint::Home,
+            home: ScreenLocation::Home,
             interrupted_edge: None,
             manual_location: None,
             manual_motion: None,
@@ -1490,6 +1562,16 @@ impl StateEngine {
         };
         engine.schedule_ambient(now_ms);
         engine
+    }
+
+    /// A character whose resting anchor is not the shared Home point.
+    /// Distinct homes are the first line of the separation policy: idle
+    /// characters never stack.
+    fn with_home(mut self, home: ScreenLocation) -> Self {
+        self.home = home;
+        self.position = home.point();
+        self.anchor = home;
+        self
     }
 
     fn schedule_ambient(&mut self, now_ms: u64) {
@@ -1783,7 +1865,8 @@ impl StateEngine {
                 None
             }
             ControlCommand::Home => {
-                Some(self.move_manual(ScreenLocation::Home, now_ms, settings.pace))
+                let home = self.home;
+                Some(self.move_manual(home, now_ms, settings.pace))
             }
             ControlCommand::Move(location) => {
                 Some(self.move_manual(location, now_ms, settings.pace))
@@ -1863,7 +1946,7 @@ impl StateEngine {
     fn step(&mut self, input: EngineInput) -> EngineOutput {
         let mut position = if self.initial_position_pending {
             self.initial_position_pending = false;
-            Some(self.issue_position(Waypoint::Home.point(), 0))
+            Some(self.issue_position(self.home.point(), 0))
         } else {
             None
         };
@@ -2131,12 +2214,34 @@ fn acquire_instance_lock(runtime_dir: &Path) -> io::Result<InstanceLock> {
     ))
 }
 
+/// One roster member's engine and output files. Every character writes the
+/// character-addressed v2 file names; the default character additionally
+/// writes the original un-suffixed v1 names until templates are migrated.
+struct Character {
+    id: &'static str,
+    actor_mask: u8,
+    thermal_reactions: bool,
+    engine: StateEngine,
+    state_path: PathBuf,
+    position_path: PathBuf,
+    control_status_path: PathBuf,
+    legacy_state_path: Option<PathBuf>,
+    legacy_position_path: Option<PathBuf>,
+    legacy_control_status_path: Option<PathBuf>,
+    last_state: String,
+    last_control_status: String,
+}
+
+/// Ambient timing must never synchronize across characters: derive each
+/// engine seed from the shared seed and the character id.
+fn character_seed(seed: u64, id: &str) -> u64 {
+    id.bytes()
+        .fold(seed, |acc, byte| acc.rotate_left(7) ^ u64::from(byte) ^ 0x9e37_79b9)
+}
+
 fn main() -> io::Result<()> {
     let uid = effective_uid()?;
     let runtime_dir = runtime_dir(uid)?;
-    let state_path = runtime_dir.join("lianli-agent-state");
-    let position_path = runtime_dir.join("lianli-agent-position");
-    let control_status_path = runtime_dir.join("lianli-agent-control-status");
     let control_config_path = control_config_path();
     let _instance_lock = acquire_instance_lock(&runtime_dir)?;
     clean_stale_work_files(&runtime_dir);
@@ -2147,27 +2252,70 @@ fn main() -> io::Result<()> {
     let mut claude_presence = Presence::default();
     let mut codex_activity = ActivityDetector::default();
     let mut claude_activity = ActivityDetector::default();
-    let mut last_state = String::new();
-    let mut last_control_status = String::new();
     let mut initialized = false;
     let started = Instant::now();
     let initial_unix_ms = unix_time_ms()?;
-    let initial_seq = read_position_seq(&position_path, initial_unix_ms);
-    let mut control_settings = read_control_settings(control_config_path.as_deref(), uid);
+    let initial_config = read_trusted_config(control_config_path.as_deref(), uid).unwrap_or_default();
+    let mut control_settings = parse_control_settings(&initial_config);
     let seed =
         initial_unix_ms ^ u64::from(process::id()).rotate_left(17) ^ u64::from(uid).rotate_left(33);
-    let mut engine = StateEngine::new(seed, 0, initial_seq);
-    if control_settings.manual_mode {
-        if let Some(point) = read_position_point(&position_path) {
-            let location = nearest_screen_location(point);
-            engine.position = point;
-            engine.anchor = location;
-            engine.manual_location = Some(location);
-            engine.initial_position_pending = false;
-        } else {
-            engine.manual_location = Some(ScreenLocation::Home);
+
+    let mut characters: Vec<Character> = Vec::new();
+    {
+        // The default character keeps its position sequence and manual-mode
+        // restore behavior from the original single-character contract.
+        let legacy_position_path = runtime_dir.join("lianli-agent-position");
+        let initial_seq = read_position_seq(&legacy_position_path, initial_unix_ms);
+        let mut engine = StateEngine::new(seed, 0, initial_seq);
+        if control_settings.manual_mode {
+            if let Some(point) = read_position_point(&legacy_position_path) {
+                let location = nearest_screen_location(point);
+                engine.position = point;
+                engine.anchor = location;
+                engine.manual_location = Some(location);
+                engine.initial_position_pending = false;
+            } else {
+                engine.manual_location = Some(ScreenLocation::Home);
+            }
         }
+        characters.push(Character {
+            id: DEFAULT_CHARACTER,
+            actor_mask: CODEX | CLAUDE,
+            thermal_reactions: true,
+            engine,
+            state_path: runtime_dir.join(format!("lianli-agent-state-{DEFAULT_CHARACTER}")),
+            position_path: runtime_dir.join(format!("lianli-agent-position-{DEFAULT_CHARACTER}")),
+            control_status_path: runtime_dir
+                .join(format!("lianli-agent-control-status-{DEFAULT_CHARACTER}")),
+            legacy_state_path: Some(runtime_dir.join("lianli-agent-state")),
+            legacy_position_path: Some(legacy_position_path),
+            legacy_control_status_path: Some(runtime_dir.join("lianli-agent-control-status")),
+            last_state: String::new(),
+            last_control_status: String::new(),
+        });
     }
+    for spec in parse_enabled_characters(&initial_config) {
+        let position_path = runtime_dir.join(format!("lianli-agent-position-{}", spec.id));
+        let initial_seq = read_position_seq(&position_path, initial_unix_ms);
+        characters.push(Character {
+            id: spec.id,
+            actor_mask: spec.actor_mask,
+            thermal_reactions: spec.thermal_reactions,
+            engine: StateEngine::new(character_seed(seed, spec.id), 0, initial_seq)
+                .with_home(spec.home),
+            state_path: runtime_dir.join(format!("lianli-agent-state-{}", spec.id)),
+            position_path,
+            control_status_path: runtime_dir
+                .join(format!("lianli-agent-control-status-{}", spec.id)),
+            legacy_state_path: None,
+            legacy_position_path: None,
+            legacy_control_status_path: None,
+            last_state: String::new(),
+            last_control_status: String::new(),
+        });
+        eprintln!("Roster: {} enabled", spec.id);
+    }
+
     let mut mask = 0u8;
     let mut next_process_sample = Instant::now();
     let mut next_thermal_sample = Instant::now();
@@ -2291,42 +2439,73 @@ fn main() -> io::Result<()> {
             None
         };
 
-        let output = engine.step(EngineInput {
-            now_ms,
-            now_unix_ms,
-            mask,
-            codex_active: codex_activity.active,
-            claude_active: claude_activity.active,
-            events,
-            thermal_sample,
-            settings: control_settings,
-            controls,
-        });
-        if let Some(command) = output.position {
-            write_position(&position_path, command)?;
-        }
-        let (mode, location) = engine.control_status();
-        let control_status = format!("v1 {mode} {}", location.as_str());
-        if control_status != last_control_status {
-            write_control_status(&control_status_path, mode, location)?;
-            last_control_status = control_status;
-        }
-        if output.state != last_state {
-            write_state(&state_path, output.state)?;
-            eprintln!(
-                "Patch state -> {} | codex cpu={}t chars={}KiB disk={}KiB cgroup={}ms | claude cpu={}t chars={}KiB disk={}KiB cgroup={}ms",
-                output.state,
-                last_codex_signals.cpu_ticks,
-                last_codex_signals.chars / 1024,
-                last_codex_signals.storage_bytes / 1024,
-                last_codex_signals.cgroup_cpu_usec / 1000,
-                last_claude_signals.cpu_ticks,
-                last_claude_signals.chars / 1024,
-                last_claude_signals.storage_bytes / 1024,
-                last_claude_signals.cgroup_cpu_usec / 1000,
-            );
-            last_state.clear();
-            last_state.push_str(output.state);
+        for character in &mut characters {
+            // Signals are collected once and masked per character: events,
+            // presence, and activity all route through the actor mask, and
+            // thermal reactions are gated by the roster entry.
+            let routed_events: Vec<EventRecord> = events
+                .iter()
+                .filter(|event| event.actor.mask() & character.actor_mask != 0)
+                .copied()
+                .collect();
+            let routed_controls: Vec<ControlCommand> = controls
+                .iter()
+                .filter(|(target, _)| {
+                    target.as_deref().unwrap_or(DEFAULT_CHARACTER) == character.id
+                })
+                .map(|(_, command)| *command)
+                .collect();
+            let mut settings = control_settings;
+            settings.thermal_reactions =
+                settings.thermal_reactions && character.thermal_reactions;
+
+            let output = character.engine.step(EngineInput {
+                now_ms,
+                now_unix_ms,
+                mask: mask & character.actor_mask,
+                codex_active: codex_activity.active && character.actor_mask & CODEX != 0,
+                claude_active: claude_activity.active && character.actor_mask & CLAUDE != 0,
+                events: routed_events,
+                thermal_sample,
+                settings,
+                controls: routed_controls,
+            });
+            if let Some(command) = output.position {
+                write_position(&character.position_path, command)?;
+                if let Some(path) = &character.legacy_position_path {
+                    write_position(path, command)?;
+                }
+            }
+            let (mode, location) = character.engine.control_status();
+            let control_status = format!("v1 {mode} {}", location.as_str());
+            if control_status != character.last_control_status {
+                write_control_status(&character.control_status_path, mode, location)?;
+                if let Some(path) = &character.legacy_control_status_path {
+                    write_control_status(path, mode, location)?;
+                }
+                character.last_control_status = control_status;
+            }
+            if output.state != character.last_state {
+                write_state(&character.state_path, output.state)?;
+                if let Some(path) = &character.legacy_state_path {
+                    write_state(path, output.state)?;
+                }
+                eprintln!(
+                    "{} state -> {} | codex cpu={}t chars={}KiB disk={}KiB cgroup={}ms | claude cpu={}t chars={}KiB disk={}KiB cgroup={}ms",
+                    character.id,
+                    output.state,
+                    last_codex_signals.cpu_ticks,
+                    last_codex_signals.chars / 1024,
+                    last_codex_signals.storage_bytes / 1024,
+                    last_codex_signals.cgroup_cpu_usec / 1000,
+                    last_claude_signals.cpu_ticks,
+                    last_claude_signals.chars / 1024,
+                    last_claude_signals.storage_bytes / 1024,
+                    last_claude_signals.cgroup_cpu_usec / 1000,
+                );
+                character.last_state.clear();
+                character.last_state.push_str(output.state);
+            }
         }
 
         let elapsed = cycle_started.elapsed();
@@ -2551,15 +2730,31 @@ mod tests {
         let now = 50_000;
         assert_eq!(
             parse_control_record(b"v1 49999 move lower-right\n", now),
-            Some((49_999, ControlCommand::Move(ScreenLocation::LowerRight)))
+            Some((49_999, (None, ControlCommand::Move(ScreenLocation::LowerRight))))
         );
         assert_eq!(
             parse_control_record(b"v1 50000 preview success\n", now),
-            Some((50_000, ControlCommand::Preview(PreviewKind::Success)))
+            Some((50_000, (None, ControlCommand::Preview(PreviewKind::Success))))
         );
         assert_eq!(
             parse_control_record(b"v1 50000 auto -\n", now),
-            Some((50_000, ControlCommand::Auto))
+            Some((50_000, (None, ControlCommand::Auto)))
+        );
+        // v2 records insert a character field before the command; `-` still
+        // addresses the default character.
+        assert_eq!(
+            parse_control_record(b"v1 50000 navigator move lower-left\n", now),
+            Some((
+                50_000,
+                (
+                    Some("navigator".to_string()),
+                    ControlCommand::Move(ScreenLocation::LowerLeft)
+                )
+            ))
+        );
+        assert_eq!(
+            parse_control_record(b"v1 50000 - home -\n", now),
+            Some((50_000, (None, ControlCommand::Home)))
         );
         for invalid in [
             "v2 50000 move left",
@@ -2569,12 +2764,60 @@ mod tests {
             "v1 50000 preview start",
             "v1 50000 home extra",
             "v1 50000 auto",
+            "v1 50000 Navigator move left",
+            "v1 50000 7seas move left",
+            "v1 50000 too-long-for-the-wire-x move left",
+            "v1 50000 navigator move left extra",
+            "v1 50000 navigator auto",
         ] {
             assert!(
                 parse_control_record(invalid.as_bytes(), now).is_none(),
                 "{invalid}"
             );
         }
+    }
+
+    #[test]
+    fn character_ids_and_roster_config_are_strict() {
+        assert!(valid_character_id("navigator"));
+        assert!(valid_character_id("mr-5"));
+        assert!(!valid_character_id(""));
+        assert!(!valid_character_id("5left"));
+        assert!(!valid_character_id("Navigator"));
+        assert!(!valid_character_id("navigator!"));
+        assert!(!valid_character_id("aaaaaaaaaaaaaaaaa"));
+
+        let enabled = parse_enabled_characters(
+            r#"{"mode":"auto","characters":["navigator","navigator","stowaway"]}"#,
+        );
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0].id, "navigator");
+        assert_eq!(enabled[0].actor_mask, CODEX);
+        assert!(parse_enabled_characters(r#"{"mode":"auto"}"#).is_empty());
+        assert!(parse_enabled_characters(r#"{"characters":"navigator"}"#).is_empty());
+        assert!(parse_enabled_characters(r#"{"characters":["navigator""#).is_empty());
+    }
+
+    #[test]
+    fn character_home_anchors_are_respected() {
+        let mut engine = StateEngine::new(23, 0, 300).with_home(ScreenLocation::LowerLeft);
+        let startup = engine.step(input(0, 0));
+        assert_eq!(
+            startup.position.unwrap().point,
+            ScreenLocation::LowerLeft.point()
+        );
+
+        let mut away = input(100, 0);
+        away.controls = vec![ControlCommand::Move(ScreenLocation::Right)];
+        engine.step(away);
+        let mut back = input(60_000, 0);
+        back.controls = vec![ControlCommand::Home];
+        let output = engine.step(back);
+        assert_eq!(
+            output.position.unwrap().point,
+            ScreenLocation::LowerLeft.point()
+        );
+        assert_eq!(engine.control_status(), ("manual", ScreenLocation::LowerLeft));
     }
 
     #[test]
@@ -2749,8 +2992,8 @@ mod tests {
         assert_eq!(
             commands,
             vec![
-                ControlCommand::Move(ScreenLocation::UpperLeft),
-                ControlCommand::Preview(PreviewKind::Success),
+                (None, ControlCommand::Move(ScreenLocation::UpperLeft)),
+                (None, ControlCommand::Preview(PreviewKind::Success)),
             ]
         );
 
@@ -2760,7 +3003,7 @@ mod tests {
         engine.step(input(0, 0));
         let mut burst = input(100, 0);
         burst.now_unix_ms = 20_050;
-        burst.controls = commands;
+        burst.controls = commands.into_iter().map(|(_, command)| command).collect();
         let output = engine.step(burst);
         assert_eq!(output.state, "event-success");
         assert_eq!(
@@ -3062,8 +3305,8 @@ mod tests {
         assert_eq!(
             commands,
             vec![
-                ControlCommand::Move(ScreenLocation::UpperLeft),
-                ControlCommand::Auto,
+                (None, ControlCommand::Move(ScreenLocation::UpperLeft)),
+                (None, ControlCommand::Auto),
             ]
         );
 

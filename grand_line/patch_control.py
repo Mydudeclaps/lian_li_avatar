@@ -45,6 +45,12 @@ PREVIEW_EVENTS = ("tool", "read", "attention", "success")
 PATTERNS = ("full", "horizontal", "vertical")
 PACES = ("slow", "normal", "quick")
 
+# The default character owns the un-suffixed v1 runtime files; optional
+# crewmates are enabled by name in the `characters` config list and are
+# addressed with character-suffixed files and v2 five-field commands.
+DEFAULT_CHARACTER = "patch"
+OPTIONAL_CHARACTERS = ("navigator",)
+
 DEFAULT_CONFIG = {
     "version": CONFIG_VERSION,
     "mode": "auto",
@@ -54,6 +60,7 @@ DEFAULT_CONFIG = {
     "micro_idles": True,
     "activity_reactions": True,
     "thermal_reactions": True,
+    "characters": [],
 }
 
 PUBLIC_TO_DISK = {
@@ -63,6 +70,7 @@ PUBLIC_TO_DISK = {
     "microIdles": "micro_idles",
     "activityReactions": "activity_reactions",
     "thermalReactions": "thermal_reactions",
+    "characters": "characters",
 }
 
 KNOWN_STATES = {
@@ -194,6 +202,13 @@ def _validate_config(value: object) -> dict:
     ):
         if type(value.get(key)) is not bool:
             raise PatchControlError(f"{key} must be a boolean")
+    characters = value.get("characters")
+    if (
+        not isinstance(characters, list)
+        or len(set(characters)) != len(characters)
+        or any(character not in OPTIONAL_CHARACTERS for character in characters)
+    ):
+        raise PatchControlError("characters must be a list of known crewmates")
     return dict(value)
 
 
@@ -277,6 +292,17 @@ class PatchControl:
                     raise PatchControlError("pattern must be full, horizontal, or vertical")
                 elif public == "pace" and value not in PACES:
                     raise PatchControlError("pace must be slow, normal, or quick")
+                elif public == "characters" and (
+                    not isinstance(value, list)
+                    or len(set(value)) != len(value)
+                    or any(
+                        character not in OPTIONAL_CHARACTERS
+                        for character in value
+                    )
+                ):
+                    raise PatchControlError(
+                        "characters must be a list of known crewmates"
+                    )
                 config[disk] = value
             self._save_config(config)
         return self.snapshot()
@@ -298,8 +324,11 @@ class PatchControl:
             "move": {"command", "location"},
             "preview": {"command", "event"},
         }[command]
-        if set(payload) != expected:
+        if not (expected <= set(payload) <= expected | {"character"}):
             raise PatchControlError("Command payload has missing or unknown fields")
+        character = payload.get("character", DEFAULT_CHARACTER)
+        if character != DEFAULT_CHARACTER and character not in OPTIONAL_CHARACTERS:
+            raise PatchControlError("Unknown mascot character")
 
         argument = "-"
         if command == "move":
@@ -317,12 +346,25 @@ class PatchControl:
                     "Too many queued mascot commands; try again shortly"
                 )
             config = self.load_config()
-            if command == "auto":
-                config["mode"] = "auto"
-                self._save_config(config)
-            elif command in {"home", "move"}:
-                config["mode"] = "manual"
-                self._save_config(config)
+            if character != DEFAULT_CHARACTER and character not in config["characters"]:
+                raise PatchControlError("That crewmate is not enabled")
+            # The stored mode only tracks the default character; crewmate
+            # manual state lives in the watcher and its control-status file.
+            if character == DEFAULT_CHARACTER:
+                if command == "auto":
+                    config["mode"] = "auto"
+                    self._save_config(config)
+                elif command in {"home", "move"}:
+                    config["mode"] = "manual"
+                    self._save_config(config)
+            # v1 four-field records address the default character; other
+            # crewmates use the v2 record with the character field inserted.
+            if character == DEFAULT_CHARACTER:
+                def record(created_ms: int) -> str:
+                    return f"v1 {created_ms} {command} {argument}\n"
+            else:
+                def record(created_ms: int) -> str:
+                    return f"v1 {created_ms} {character} {command} {argument}\n"
             # Timestamps are only unique within this instance; another
             # bridge instance or process can race the same millisecond, so
             # publish without clobbering and re-stamp on collision.
@@ -331,7 +373,7 @@ class PatchControl:
                 try:
                     _atomic_write(
                         self._command_queue_entry(created_ms),
-                        f"v1 {created_ms} {command} {argument}\n",
+                        record(created_ms),
                         exclusive=True,
                     )
                     break
@@ -343,8 +385,11 @@ class PatchControl:
                 )
         return self.snapshot()
 
-    def _control_status(self) -> tuple[str, str] | None:
-        path = self.runtime_dir / CONTROL_STATUS_FILE_NAME
+    def _control_status(self, character: str | None = None) -> tuple[str, str] | None:
+        name = CONTROL_STATUS_FILE_NAME
+        if character is not None:
+            name = f"{name}-{character}"
+        path = self.runtime_dir / name
         try:
             metadata = os.lstat(path)
             if (
@@ -365,9 +410,12 @@ class PatchControl:
             return fields[1], fields[2]
         return None
 
-    def _state(self) -> str:
+    def _state(self, character: str | None = None) -> str:
+        name = STATE_FILE_NAME
+        if character is not None:
+            name = f"{name}-{character}"
         try:
-            state = (self.runtime_dir / STATE_FILE_NAME).read_text(
+            state = (self.runtime_dir / name).read_text(
                 encoding="ascii"
             ).strip()
         except (OSError, UnicodeError):
@@ -411,10 +459,29 @@ class PatchControl:
         config = self.load_config()
         status = self._control_status()
         mode, location = status or (config["mode"], self._fallback_location())
+        state = self._state()
+        # The single-character shape stays intact for existing dashboards;
+        # per-character detail rides alongside it.
+        characters = {
+            DEFAULT_CHARACTER: {
+                "mode": mode,
+                "state": state,
+                "location": location,
+            }
+        }
+        for character in config["characters"]:
+            crew_status = self._control_status(character)
+            crew_mode, crew_location = crew_status or ("auto", "unknown")
+            characters[character] = {
+                "mode": crew_mode,
+                "state": self._state(character),
+                "location": crew_location,
+            }
         return {
             "mode": mode,
-            "state": self._state(),
+            "state": state,
             "location": location,
             "service": self._watcher_service(),
             "settings": _public_settings(config),
+            "characters": characters,
         }

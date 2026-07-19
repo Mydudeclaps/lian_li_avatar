@@ -69,6 +69,7 @@ class PatchControlTests(unittest.TestCase):
                 "microIdles": False,
                 "activityReactions": True,
                 "thermalReactions": False,
+                "characters": [],
             },
         )
         disk = json.loads(self.config_file.read_text(encoding="utf-8"))
@@ -177,6 +178,66 @@ class PatchControlTests(unittest.TestCase):
             self.control.send_command({"command": "auto"})
         self.assertEqual(len(self.queued_commands()), 16)
 
+    def test_crewmate_commands_use_v2_records_and_require_enablement(self):
+        # Not enabled yet: the bridge refuses rather than queueing a record
+        # the watcher would drop.
+        with self.assertRaises(PatchControlError):
+            self.control.send_command(
+                {"command": "move", "location": "lower-left", "character": "navigator"}
+            )
+        with self.assertRaises(PatchControlError):
+            self.control.send_command(
+                {"command": "move", "location": "left", "character": "stowaway"}
+            )
+        self.assertEqual(self.queued_commands(), [])
+
+        snapshot = self.control.update_settings({"characters": ["navigator"]})
+        self.assertEqual(snapshot["settings"]["characters"], ["navigator"])
+
+        self.control.send_command(
+            {"command": "move", "location": "lower-left", "character": "navigator"}
+        )
+        [command_file] = self.queued_commands()
+        self.assertEqual(
+            command_file.read_text(encoding="utf-8"),
+            "v1 1000000 navigator move lower-left\n",
+        )
+        command_file.unlink()
+        # Crewmate commands never flip the stored (default character) mode.
+        self.assertEqual(self.control.load_config()["mode"], "auto")
+
+        # An explicit default-character field still writes v1 four-field
+        # records so old watchers keep working during migration.
+        self.control.send_command(
+            {"command": "move", "location": "right", "character": "patch"}
+        )
+        [command_file] = self.queued_commands()
+        self.assertEqual(
+            command_file.read_text(encoding="utf-8"),
+            "v1 1000001 move right\n",
+        )
+        command_file.unlink()
+        self.assertEqual(self.control.load_config()["mode"], "manual")
+
+    def test_snapshot_reports_enabled_crewmates(self):
+        self.control.update_settings({"characters": ["navigator"]})
+        (self.runtime_dir / "lianli-agent-state-navigator").write_text(
+            "codex-active", encoding="ascii"
+        )
+        (self.runtime_dir / "lianli-agent-control-status-navigator").write_text(
+            "v1 manual lower-left\n", encoding="ascii"
+        )
+        snapshot = self.control.snapshot()
+        self.assertEqual(
+            snapshot["characters"]["navigator"],
+            {"mode": "manual", "state": "codex-active", "location": "lower-left"},
+        )
+        self.assertIn("patch", snapshot["characters"])
+        with self.assertRaises(PatchControlError):
+            self.control.update_settings({"characters": ["navigator", "navigator"]})
+        with self.assertRaises(PatchControlError):
+            self.control.update_settings({"characters": ["doctor"]})
+
     def test_command_payload_and_semantic_values_are_allowlisted(self):
         invalid = (
             {"command": "shell", "value": "rm"},
@@ -257,7 +318,7 @@ class PatchControlTests(unittest.TestCase):
         snapshot = self.control.snapshot()
         self.assertEqual(
             set(snapshot),
-            {"mode", "state", "location", "service", "settings"},
+            {"mode", "state", "location", "service", "settings", "characters"},
         )
         self.assertEqual(
             set(snapshot["settings"]),
@@ -268,6 +329,7 @@ class PatchControlTests(unittest.TestCase):
                 "microIdles",
                 "activityReactions",
                 "thermalReactions",
+                "characters",
             },
         )
         self.assertEqual(set(snapshot["service"]), {"active", "status"})
