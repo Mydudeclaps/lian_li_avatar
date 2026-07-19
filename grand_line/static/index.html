@@ -11,39 +11,23 @@
     <header>
       <small>COOLER DISPLAY</small>
       <h1>PATCH COMMAND</h1>
-      <p>Guide our little coding deckhand around the screen.</p>
+      <p>Guide our little coding deckhands around the screen.</p>
     </header>
 
-    <section class="card status" id="statusCard">
+    <section class="card bridge-status" id="statusCard">
       <div class="status-head">
         <span><i></i><b id="service">CHECKING</b></span>
         <em id="updated">CONTACTING PATCH…</em>
       </div>
-      <div class="readouts">
-        <div><small>MODE</small><strong id="mode">—</strong></div>
-        <div><small>ANIMATION</small><strong id="state">—</strong></div>
-        <div><small>LOCATION</small><strong id="location">—</strong></div>
-      </div>
     </section>
 
-    <div class="main-orders">
-      <button data-command="auto"><b>✦</b><span>AUTO WATCH</span><small>Let Patch decide</small></button>
-      <button data-command="home"><b>⌂</b><span>CALL HOME</span><small>Return to his post</small></button>
-    </div>
+    <div id="characterCards" class="character-cards" aria-live="polite"></div>
 
-    <section class="card">
-      <h2><span>SCREEN POSITION</span><em>FULL 3 × 3 GRID</em></h2>
-      <div class="direction-pad">
-        <button data-location="upper-left"><b>↖</b><span>UPPER LEFT</span></button>
-        <button data-location="up"><b>↑</b><span>UP</span></button>
-        <button data-location="upper-right"><b>↗</b><span>UPPER RIGHT</span></button>
-        <button data-location="left"><b>←</b><span>LEFT</span></button>
-        <button data-location="center"><b>●</b><span>CENTER</span></button>
-        <button data-location="right"><b>→</b><span>RIGHT</span></button>
-        <button data-location="lower-left"><b>↙</b><span>LOWER LEFT</span></button>
-        <button data-location="down"><b>↓</b><span>DOWN</span></button>
-        <button data-location="lower-right"><b>↘</b><span>LOWER RIGHT</span></button>
-      </div>
+    <section class="card settings">
+      <h2><span>CREW</span><em>OPTIONAL DECKHANDS</em></h2>
+      <button class="toggle crew-toggle" data-character-toggle="navigator" role="switch" aria-checked="false">
+        <span>ENABLE NAVIGATOR</span><i></i>
+      </button>
     </section>
 
     <section class="card settings">
@@ -73,17 +57,51 @@
         <button data-toggle="thermalReactions" aria-pressed="false">THERMALS</button>
       </div>
     </section>
-
-    <section class="card">
-      <h2><span>ANIMATION PREVIEW</span><em>TAP TO PLAY</em></h2>
-      <div class="previews">
-        <button data-preview="tool">⚒<span>TOOL</span></button>
-        <button data-preview="read">▤<span>READ</span></button>
-        <button data-preview="attention">!<span>AHOY!</span></button>
-        <button data-preview="success">★<span>SUCCESS</span></button>
-      </div>
-    </section>
   </main>
+
+  <template id="characterCardTemplate">
+    <article class="character-card" data-character="">
+      <h2 class="character-title"><span data-character-name>PATCH</span><em data-character-kind>CAPTAIN</em></h2>
+      <section class="card status">
+        <div class="readouts">
+          <div><small>MODE</small><strong data-readout="mode">—</strong></div>
+          <div><small>ANIMATION</small><strong data-readout="state">—</strong></div>
+          <div><small>LOCATION</small><strong data-readout="location">—</strong></div>
+        </div>
+      </section>
+
+      <div class="main-orders">
+        <button data-command="auto"><b>✦</b><span>AUTO WATCH</span><small>Let this crewmate decide</small></button>
+        <button data-command="home"><b>⌂</b><span>CALL HOME</span><small>Return to their post</small></button>
+      </div>
+
+      <section class="card">
+        <h2><span>SCREEN POSITION</span><em>FULL 3 × 3 GRID</em></h2>
+        <div class="direction-pad">
+          <button data-location="upper-left"><b>↖</b><span>UPPER LEFT</span></button>
+          <button data-location="up"><b>↑</b><span>UP</span></button>
+          <button data-location="upper-right"><b>↗</b><span>UPPER RIGHT</span></button>
+          <button data-location="left"><b>←</b><span>LEFT</span></button>
+          <button data-location="center"><b>●</b><span>CENTER</span></button>
+          <button data-location="right"><b>→</b><span>RIGHT</span></button>
+          <button data-location="lower-left"><b>↙</b><span>LOWER LEFT</span></button>
+          <button data-location="down"><b>↓</b><span>DOWN</span></button>
+          <button data-location="lower-right"><b>↘</b><span>LOWER RIGHT</span></button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2><span>ANIMATION PREVIEW</span><em>TAP TO PLAY</em></h2>
+        <div class="previews">
+          <button data-preview="tool">⚒<span>TOOL</span></button>
+          <button data-preview="read">▤<span>READ</span></button>
+          <button data-preview="attention">!<span>AHOY!</span></button>
+          <button data-preview="success">★<span>SUCCESS</span></button>
+        </div>
+      </section>
+    </article>
+  </template>
+
   <div class="toast" id="toast">ORDER SENT</div>
   <script src="/patch.js"></script>
 </body>

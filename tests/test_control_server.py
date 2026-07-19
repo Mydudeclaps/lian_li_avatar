@@ -81,6 +81,8 @@ class PatchServerTests(unittest.TestCase):
         status, headers, body = self.request("GET", "/")
         self.assertEqual(status, 200)
         self.assertIn(b"PATCH COMMAND", body)
+        self.assertIn(b'id="characterCardTemplate"', body)
+        self.assertIn(b'data-character-toggle="navigator"', body)
         self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
         self.assertIn("default-src 'self'", headers["Content-Security-Policy"])
 
@@ -94,6 +96,47 @@ class PatchServerTests(unittest.TestCase):
                 status, _, body = self.request("GET", path)
                 self.assertEqual(status, 404)
                 self.assertFalse(body["ok"])
+
+    def test_crewmate_command_round_trips_through_http_api(self):
+        status, _, snapshot = self.request(
+            "POST",
+            "/api/patch/settings",
+            {"characters": ["navigator"]},
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("navigator", snapshot["characters"])
+
+        status, _, snapshot = self.request(
+            "POST",
+            "/api/patch/command",
+            {"command": "move", "location": "lower-left", "character": "navigator"},
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("navigator", snapshot["characters"])
+        command_files = self.server.RequestHandlerClass.control._queued_command_files()
+        self.assertEqual(len(command_files), 1)
+        self.assertIn(
+            " navigator move lower-left\n",
+            command_files[0].read_text(encoding="utf-8"),
+        )
+
+        status, _, snapshot = self.request(
+            "POST",
+            "/api/patch/settings",
+            {"characters": []},
+        )
+        self.assertEqual(status, 200)
+        self.assertNotIn("navigator", snapshot["characters"])
+
+    def test_javascript_renders_characters_and_addresses_crewmates(self):
+        status, _, script = self.request("GET", "/patch.js")
+        self.assertEqual(status, 200)
+        self.assertIn(b"renderCharacters(data.characters)", script)
+        self.assertIn(
+            b'character !== "patch" ? {...fields, character} : fields',
+            script,
+        )
+        self.assertIn(b"post(endpoints.settings, {characters})", script)
 
     def test_invalid_cross_origin_and_oversized_posts_are_rejected(self):
         status, _, body = self.request(
