@@ -7,9 +7,16 @@
 - premultiplied-alpha crossfades without the opaque-black flash;
 - lossless compressed APNG frame storage and variant deduplication;
 - compressed full-screen video frames to keep memory bounded;
-- relative variant-path rewriting and backward-compatible template schema.
+- relative variant-path rewriting and backward-compatible template schema;
+- render pipeline optimizations: a direct-blit fast path for opaque
+  unrotated video widgets, turbojpeg SIMD decode straight to RGBA,
+  a tiled allocation-free rotate in the encode path, span-indexed blits
+  for sparse cached overlays, and a capped per-clip decoded-frame cache
+  so short mascot loops decode once;
+- a shared render clock that ticks at the fastest widget fps so mascot,
+  video, and text updates coalesce into one render per tick.
 
-The patch contains ten files and targets
+The patch contains eleven files and targets
 [`sgtaziz/lian-li-linux`](https://github.com/sgtaziz/lian-li-linux) at commit
 `d262007c9bfbe87ae7c9d390d68ec74e5deb4d0a`.
 

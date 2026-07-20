@@ -10,8 +10,156 @@ index a1ab77e..5ac81ca 100644
          },
          "sparkline" => WidgetKind::Sparkline {
              source: SensorSourceConfig::Constant { value: 0.0 },
+diff --git c/crates/lianli-media/src/common.rs w/crates/lianli-media/src/common.rs
+index e8b2e6d..8c47065 100644
+--- c/crates/lianli-media/src/common.rs
++++ w/crates/lianli-media/src/common.rs
+@@ -1,6 +1,6 @@
+ use ab_glyph::{point, Font, FontVec, PxScale, ScaleFont};
+ use image::imageops::{rotate180, rotate270, rotate90};
+-use image::{RgbImage, RgbaImage};
++use image::RgbImage;
+ use lianli_shared::screen::ScreenInfo;
+ use thiserror::Error;
+ 
+@@ -61,22 +61,84 @@ pub fn encode_jpeg_rgba(
+         return encode_compressed(tj_image, screen);
+     }
+ 
+-    let img = RgbaImage::from_raw(width, height, rgba.to_vec())
+-        .ok_or_else(|| MediaError::ImageError("rgba bytes don't match dimensions".into()))?;
+-    let rotated = match total_rot {
+-        90 => rotate90(&img),
+-        180 => rotate180(&img),
+-        270 => rotate270(&img),
+-        _ => img,
+-    };
+-    let tj_image = turbojpeg::Image {
+-        pixels: rotated.as_raw().as_slice(),
+-        width: rotated.width() as usize,
+-        pitch: rotated.width() as usize * 4,
+-        height: rotated.height() as usize,
+-        format: turbojpeg::PixelFormat::RGBA,
+-    };
+-    encode_compressed(tj_image, screen)
++    let expected_len = (width as usize)
++        .checked_mul(height as usize)
++        .and_then(|px| px.checked_mul(4));
++    if expected_len != Some(rgba.len()) {
++        return Err(MediaError::ImageError(
++            "rgba bytes don't match dimensions".into(),
++        ));
++    }
++    ROTATE_BUF.with(|cell| {
++        let mut buf = cell.borrow_mut();
++        rotate_rgba_into(rgba, width as usize, height as usize, total_rot, &mut buf);
++        let (rw, rh) = match total_rot {
++            90 | 270 => (height as usize, width as usize),
++            _ => (width as usize, height as usize),
++        };
++        let tj_image = turbojpeg::Image {
++            pixels: buf.as_slice(),
++            width: rw,
++            pitch: rw * 4,
++            height: rh,
++            format: turbojpeg::PixelFormat::RGBA,
++        };
++        encode_compressed(tj_image, screen)
++    })
++}
++
++thread_local! {
++    static ROTATE_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
++}
++
++/// Rotate tightly-packed RGBA pixels into `out`, reusing its allocation.
++/// Tiled so strided reads stay cache-resident; the image-crate rotate on the
++/// render hot path cost an extra full-frame input copy plus a cache-hostile
++/// full-frame traversal per frame.
++fn rotate_rgba_into(src: &[u8], w: usize, h: usize, rot: u16, out: &mut Vec<u8>) {
++    const TILE: usize = 64;
++    out.clear();
++    out.resize(src.len(), 0);
++    match rot {
++        // dst is h wide, w tall; dst(dx, dy) = src(dy, h - 1 - dx)
++        90 => {
++            for by in (0..w).step_by(TILE) {
++                for bx in (0..h).step_by(TILE) {
++                    for dy in by..(by + TILE).min(w) {
++                        for dx in bx..(bx + TILE).min(h) {
++                            let d = (dy * h + dx) * 4;
++                            let s = ((h - 1 - dx) * w + dy) * 4;
++                            out[d..d + 4].copy_from_slice(&src[s..s + 4]);
++                        }
++                    }
++                }
++            }
++        }
++        // dst is h wide, w tall; dst(dx, dy) = src(w - 1 - dy, dx)
++        270 => {
++            for by in (0..w).step_by(TILE) {
++                for bx in (0..h).step_by(TILE) {
++                    for dy in by..(by + TILE).min(w) {
++                        for dx in bx..(bx + TILE).min(h) {
++                            let d = (dy * h + dx) * 4;
++                            let s = (dx * w + (w - 1 - dy)) * 4;
++                            out[d..d + 4].copy_from_slice(&src[s..s + 4]);
++                        }
++                    }
++                }
++            }
++        }
++        // same dims; dst(dx, dy) = src(w - 1 - dx, h - 1 - dy)
++        _ => {
++            for dy in 0..h {
++                for dx in 0..w {
++                    let d = (dy * w + dx) * 4;
++                    let s = ((h - 1 - dy) * w + (w - 1 - dx)) * 4;
++                    out[d..d + 4].copy_from_slice(&src[s..s + 4]);
++                }
++            }
++        }
++    }
+ }
+ 
+ fn encode_compressed(
+@@ -203,3 +265,34 @@ pub fn hsl_to_rgb(h: f32, s: f32, l: f32) -> [u8; 3] {
+         ((b_temp + m) * 255.0).round() as u8,
+     ]
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::rotate_rgba_into;
++    use image::imageops::{rotate180, rotate270, rotate90};
++    use image::RgbaImage;
++
++    fn checkered(w: u32, h: u32) -> RgbaImage {
++        RgbaImage::from_fn(w, h, |x, y| {
++            let i = (y * w + x) as u8;
++            image::Rgba([i, i.wrapping_mul(3), i.wrapping_add(7), 255 - i])
++        })
++    }
++
++    #[test]
++    fn tiled_rotate_matches_image_crate() {
++        // Odd sizes exercise the partial-tile edges.
++        for (w, h) in [(5u32, 3u32), (64, 64), (130, 67)] {
++            let img = checkered(w, h);
++            let mut out = Vec::new();
++            for (rot, reference) in [
++                (90u16, rotate90(&img).into_raw()),
++                (180, rotate180(&img).into_raw()),
++                (270, rotate270(&img).into_raw()),
++            ] {
++                rotate_rgba_into(img.as_raw(), w as usize, h as usize, rot, &mut out);
++                assert_eq!(out, reference, "rot {rot} mismatch at {w}x{h}");
++            }
++        }
++    }
++}
 diff --git c/crates/lianli-media/src/custom.rs w/crates/lianli-media/src/custom.rs
-index 2210fdb..a3a3927 100644
+index 2210fdb..9596471 100644
 --- c/crates/lianli-media/src/custom.rs
 +++ w/crates/lianli-media/src/custom.rs
 @@ -10,7 +10,7 @@ mod widgets;
@@ -32,13 +180,14 @@ index 2210fdb..a3a3927 100644
  use std::sync::atomic::{AtomicUsize, Ordering};
  use std::sync::Arc;
  use std::time::{Duration, Instant};
- use tracing::warn;
+-use tracing::warn;
 -use widgets::{draw_widget, WidgetState};
++use tracing::{info, warn};
 +use widgets::{draw_widget, VideoClip, VideoTransition, WidgetState};
  
  fn default_sample_interval(kind: &WidgetKind, explicit_ms: Option<u64>) -> Duration {
      let default_ms = match kind {
-@@ -47,6 +47,194 @@ fn default_sample_interval(kind: &WidgetKind, explicit_ms: Option<u64>) -> Durat
+@@ -47,6 +47,201 @@ fn default_sample_interval(kind: &WidgetKind, explicit_ms: Option<u64>) -> Durat
      Duration::from_millis(explicit_ms.unwrap_or(default_ms).max(min_ms))
  }
  
@@ -183,7 +332,14 @@ index 2210fdb..a3a3927 100644
 +    elapsed_ms: u64,
 +    crossfade_ms: u64,
 +) {
-+    let previous_render = state.cached_render.take();
++    // The fast video path doesn't populate cached_render; fall back to the
++    // decoded frame so a crossfade still starts from the outgoing clip.
++    let previous_render = state.cached_render.take().or_else(|| {
++        state.video_frame_cache.take().and_then(|mut cache| {
++            let idx = cache.last_idx;
++            cache.frames.remove(&idx).map(|(frame, _)| frame)
++        })
++    });
 +    state.active_video_variant = selected;
 +    state.video_clip_epoch_ms = elapsed_ms;
 +    state.last_video_frame_idx = None;
@@ -233,7 +389,7 @@ index 2210fdb..a3a3927 100644
  pub struct CustomAsset {
      template: LcdTemplate,
      widget_states: Mutex<Vec<WidgetState>>,
-@@ -183,22 +371,23 @@ impl CustomAsset {
+@@ -183,22 +378,23 @@ impl CustomAsset {
                  }
              }
  
@@ -272,7 +428,7 @@ index 2210fdb..a3a3927 100644
                      }
                      Err(e) => warn!(
                          "template '{}' widget '{}' video '{}' decode failed: {e}",
-@@ -207,6 +396,35 @@ impl CustomAsset {
+@@ -207,14 +403,62 @@ impl CustomAsset {
                          path.display()
                      ),
                  }
@@ -308,7 +464,35 @@ index 2210fdb..a3a3927 100644
              }
  
              widget_states.push(state);
-@@ -404,30 +622,103 @@ impl CustomAsset {
+         }
+ 
+-        let fps = screen.max_fps.max(1);
++        // Tick at the fastest widget fps rather than the panel cap: every
++        // widget's due-check runs on this shared clock, so slower widgets
++        // (mascots, text) coalesce into the same render instead of dirtying
++        // extra polls between video frames. Templates that declare no fps
++        // keep the legacy screen-rate polling.
++        let template_fps = template
++            .widgets
++            .iter()
++            .filter(|w| w.visible)
++            .filter_map(|w| w.fps)
++            .fold(0.0f32, f32::max);
++        let fps = if template_fps > 0.0 {
++            (template_fps.ceil() as u32).clamp(1, screen.max_fps.max(1))
++        } else {
++            screen.max_fps.max(1)
++        };
+         let frame_interval =
+             Duration::from_nanos(1_000_000_000 / fps as u64).max(Duration::from_millis(16));
++        info!(
++            "custom template '{}' render clock: {fps} fps ({frame_interval:?} tick)",
++            template.id
++        );
+ 
+         let scratch = composite.clone();
+         Ok(Arc::new(Self {
+@@ -404,30 +648,103 @@ impl CustomAsset {
                          any_dynamic_changed = true;
                      }
                  }
@@ -425,13 +609,14 @@ index 2210fdb..a3a3927 100644
                                  any_dynamic_changed = true;
                              }
                          }
-@@ -468,3 +759,385 @@ impl CustomAsset {
+@@ -468,3 +785,412 @@ impl CustomAsset {
          Ok(Some(result))
      }
  }
 +
 +#[cfg(test)]
 +mod tests {
++    use super::widgets::VideoFrameCache;
 +    use super::*;
 +    use lianli_shared::template::{ImageFit, TemplateBackground, VideoSelector, Widget};
 +    use std::collections::BTreeMap;
@@ -543,7 +728,14 @@ index 2210fdb..a3a3927 100644
 +        let mut state = WidgetState::blank();
 +        state.cached_render = Some(outgoing.clone());
 +        state.cached_render_key = Some(7);
-+        state.video_frame_cache = Some(("old".into(), 3, RgbaImage::new(2, 1)));
++        let mut cache = VideoFrameCache {
++            clip_key: String::new(),
++            frames: HashMap::new(),
++            bytes: 0,
++            last_idx: 0,
++        };
++        cache.insert("old", 3, RgbaImage::new(2, 1), true);
++        state.video_frame_cache = Some(cache);
 +
 +        activate_video_variant(&mut state, Some("new".into()), 100, 250);
 +
@@ -562,6 +754,25 @@ index 2210fdb..a3a3927 100644
 +        );
 +        assert!(advance_video_transition(&mut state, 350));
 +        assert!(state.video_transition.is_none());
++    }
++
++    #[test]
++    fn selector_change_falls_back_to_decoded_frame_for_crossfade() {
++        let outgoing = RgbaImage::from_pixel(2, 1, Rgba([20, 40, 60, 255]));
++        let mut state = WidgetState::blank();
++        let mut cache = VideoFrameCache {
++            clip_key: String::new(),
++            frames: HashMap::new(),
++            bytes: 0,
++            last_idx: 0,
++        };
++        cache.insert("old", 3, outgoing.clone(), true);
++        state.video_frame_cache = Some(cache);
++
++        activate_video_variant(&mut state, Some("new".into()), 100, 250);
++
++        let transition = state.video_transition.as_ref().expect("transition");
++        assert_eq!(transition.from_overlay, outgoing);
 +    }
 +
 +    #[test]
@@ -812,13 +1023,220 @@ index 2210fdb..a3a3927 100644
 +    }
 +}
 diff --git c/crates/lianli-media/src/custom/helpers/drawing.rs w/crates/lianli-media/src/custom/helpers/drawing.rs
-index 97d2e9e..51400dd 100644
+index 97d2e9e..9010043 100644
 --- c/crates/lianli-media/src/custom/helpers/drawing.rs
 +++ w/crates/lianli-media/src/custom/helpers/drawing.rs
-@@ -329,6 +329,41 @@ pub fn fast_overlay(dst: &mut RgbaImage, src: &RgbaImage, tl_x: i64, tl_y: i64)
+@@ -291,44 +291,216 @@ pub fn fast_overlay(dst: &mut RgbaImage, src: &RgbaImage, tl_x: i64, tl_y: i64)
+             &src_buf[sy * src_stride + src_x0_bytes..sy * src_stride + src_x0_bytes + row_bytes];
+ 
+         for (dpx, spx) in dst_row.chunks_exact_mut(4).zip(src_row.chunks_exact(4)) {
+-            let sa = spx[3] as u32;
+-            if sa == 0 {
+-                continue;
+-            }
+-            if sa == 255 {
+-                dpx[0] = spx[0];
+-                dpx[1] = spx[1];
+-                dpx[2] = spx[2];
+-                dpx[3] = 255;
+-                continue;
+-            }
+-            let inv = 255 - sa;
+-            let da = dpx[3] as u32;
+-            let sr = spx[0] as u32;
+-            let sg = spx[1] as u32;
+-            let sb = spx[2] as u32;
+-            let dr = dpx[0] as u32;
+-            let dg = dpx[1] as u32;
+-            let db = dpx[2] as u32;
+-            if da == 255 {
+-                dpx[0] = ((sr * sa + dr * inv + 127) / 255) as u8;
+-                dpx[1] = ((sg * sa + dg * inv + 127) / 255) as u8;
+-                dpx[2] = ((sb * sa + db * inv + 127) / 255) as u8;
+-            } else {
+-                let denom = sa * 255 + da * inv;
+-                if denom == 0 {
+-                    continue;
++            blend_pixel(dpx, spx);
++        }
++    }
++}
++
++/// Per-row runs of non-transparent pixels, as (start, end) pixel columns.
++pub type RowSpans = Vec<Vec<(u32, u32)>>;
++
++/// Precompute the non-transparent runs of a cached overlay so repeat blits
++/// can skip fully-transparent pixels entirely. Returns None when the overlay
++/// is small (plain blit is already cheap) or dense (span bookkeeping would
++/// not pay for itself).
++pub fn compute_overlay_spans(src: &RgbaImage) -> Option<RowSpans> {
++    const MIN_AREA: u32 = 1 << 16;
++    const MERGE_GAP: u32 = 16;
++    const MAX_COVERAGE: f32 = 0.85;
++
++    let (w, h) = (src.width(), src.height());
++    if (w as u64) * (h as u64) < MIN_AREA as u64 {
++        return None;
++    }
++
++    let buf: &[u8] = src.as_raw();
++    let mut spans: RowSpans = Vec::with_capacity(h as usize);
++    let mut covered: u64 = 0;
++    for y in 0..h as usize {
++        let row = &buf[y * w as usize * 4..(y + 1) * w as usize * 4];
++        let mut runs: Vec<(u32, u32)> = Vec::new();
++        let mut run_start: Option<u32> = None;
++        let mut last_visible: u32 = 0;
++        for (x, px) in row.chunks_exact(4).enumerate() {
++            if px[3] != 0 {
++                let x = x as u32;
++                match run_start {
++                    None => run_start = Some(x),
++                    Some(_) if x > last_visible + MERGE_GAP => {
++                        runs.push((run_start.take().unwrap(), last_visible + 1));
++                        run_start = Some(x);
++                    }
++                    _ => {}
+                 }
+-                let half = denom / 2;
+-                dpx[0] = ((sa * sr * 255 + da * inv * dr + half) / denom) as u8;
+-                dpx[1] = ((sa * sg * 255 + da * inv * dg + half) / denom) as u8;
+-                dpx[2] = ((sa * sb * 255 + da * inv * db + half) / denom) as u8;
+-                dpx[3] = ((denom + 127) / 255) as u8;
++                last_visible = x;
++            }
++        }
++        if let Some(start) = run_start {
++            runs.push((start, last_visible + 1));
++        }
++        covered += runs.iter().map(|(a, b)| (b - a) as u64).sum::<u64>();
++        spans.push(runs);
++    }
++
++    if covered as f32 / (w as u64 * h as u64) as f32 > MAX_COVERAGE {
++        return None;
++    }
++    Some(spans)
++}
++
++/// Like `fast_overlay`, but touches only the precomputed non-transparent
++/// runs of `src`.
++pub fn fast_overlay_with_spans(
++    dst: &mut RgbaImage,
++    src: &RgbaImage,
++    tl_x: i64,
++    tl_y: i64,
++    spans: &RowSpans,
++) {
++    let dw = dst.width() as i64;
++    let dh = dst.height() as i64;
++    let sw = src.width() as i64;
++    let sh = src.height() as i64;
++
++    let dy0 = tl_y.max(0);
++    let dy1 = (tl_y + sh).min(dh);
++    if dy0 >= dy1 {
++        return;
++    }
++
++    let dst_stride = dst.width() as usize * 4;
++    let src_stride = src.width() as usize * 4;
++    let dst_buf: &mut [u8] = dst.as_mut();
++    let src_buf: &[u8] = src.as_raw();
++
++    for dy in dy0..dy1 {
++        let sy = (dy - tl_y) as usize;
++        for &(rx0, rx1) in &spans[sy] {
++            // Clip the run against the destination bounds.
++            let dx0 = (tl_x + rx0 as i64).max(0);
++            let dx1 = (tl_x + rx1 as i64).min(dw).min(tl_x + sw);
++            if dx0 >= dx1 {
++                continue;
++            }
++            let run_px = (dx1 - dx0) as usize;
++            let d = dy as usize * dst_stride + dx0 as usize * 4;
++            let s = sy * src_stride + (dx0 - tl_x) as usize * 4;
++            let dst_row = &mut dst_buf[d..d + run_px * 4];
++            let src_row = &src_buf[s..s + run_px * 4];
++            for (dpx, spx) in dst_row.chunks_exact_mut(4).zip(src_row.chunks_exact(4)) {
++                blend_pixel(dpx, spx);
+             }
+         }
      }
  }
  
++#[inline(always)]
++fn blend_pixel(dpx: &mut [u8], spx: &[u8]) {
++    let sa = spx[3] as u32;
++    if sa == 0 {
++        return;
++    }
++    if sa == 255 {
++        dpx[0] = spx[0];
++        dpx[1] = spx[1];
++        dpx[2] = spx[2];
++        dpx[3] = 255;
++        return;
++    }
++    let inv = 255 - sa;
++    let da = dpx[3] as u32;
++    let sr = spx[0] as u32;
++    let sg = spx[1] as u32;
++    let sb = spx[2] as u32;
++    let dr = dpx[0] as u32;
++    let dg = dpx[1] as u32;
++    let db = dpx[2] as u32;
++    if da == 255 {
++        dpx[0] = ((sr * sa + dr * inv + 127) / 255) as u8;
++        dpx[1] = ((sg * sa + dg * inv + 127) / 255) as u8;
++        dpx[2] = ((sb * sa + db * inv + 127) / 255) as u8;
++    } else {
++        let denom = sa * 255 + da * inv;
++        if denom == 0 {
++            return;
++        }
++        let half = denom / 2;
++        dpx[0] = ((sa * sr * 255 + da * inv * dr + half) / denom) as u8;
++        dpx[1] = ((sa * sg * 255 + da * inv * dg + half) / denom) as u8;
++        dpx[2] = ((sa * sb * 255 + da * inv * db + half) / denom) as u8;
++        dpx[3] = ((denom + 127) / 255) as u8;
++    }
++}
++
++/// Overlay `src` onto `dst` when every `src` pixel is known to be fully
++/// opaque (e.g. a JPEG-decoded video frame): rows are block-copied instead of
++/// alpha-blended per pixel.
++pub fn fast_overlay_opaque(dst: &mut RgbaImage, src: &RgbaImage, tl_x: i64, tl_y: i64) {
++    let dw = dst.width() as i64;
++    let dh = dst.height() as i64;
++    let sw = src.width() as i64;
++    let sh = src.height() as i64;
++
++    let dx0 = tl_x.max(0);
++    let dy0 = tl_y.max(0);
++    let dx1 = (tl_x + sw).min(dw);
++    let dy1 = (tl_y + sh).min(dh);
++    if dx0 >= dx1 || dy0 >= dy1 {
++        return;
++    }
++
++    let copy_w = (dx1 - dx0) as usize;
++    let dst_stride = dst.width() as usize * 4;
++    let src_stride = src.width() as usize * 4;
++    let dst_x0_bytes = dx0 as usize * 4;
++    let src_x0_bytes = (dx0 - tl_x) as usize * 4;
++    let row_bytes = copy_w * 4;
++    let dst_buf: &mut [u8] = dst.as_mut();
++    let src_buf: &[u8] = src.as_raw();
++
++    for dy in dy0..dy1 {
++        let sy = (dy - tl_y) as usize;
++        let d = dy as usize * dst_stride + dst_x0_bytes;
++        let s = sy * src_stride + src_x0_bytes;
++        dst_buf[d..d + row_bytes].copy_from_slice(&src_buf[s..s + row_bytes]);
++    }
++}
++
 +/// Interpolate two straight-alpha RGBA overlays in premultiplied-alpha space.
 +///
 +/// Interpolating straight RGB values darkens antialiased edges when one side
@@ -857,7 +1275,7 @@ index 97d2e9e..51400dd 100644
  pub fn blit_with_opacity(dst: &mut RgbaImage, src: &RgbaImage, opacity: f32) {
      let o = opacity.clamp(0.0, 1.0);
      if o <= 0.0 {
-@@ -353,3 +388,40 @@ pub fn blit_with_opacity(dst: &mut RgbaImage, src: &RgbaImage, opacity: f32) {
+@@ -353,3 +525,40 @@ pub fn blit_with_opacity(dst: &mut RgbaImage, src: &RgbaImage, opacity: f32) {
          }
      }
  }
@@ -899,35 +1317,38 @@ index 97d2e9e..51400dd 100644
 +    }
 +}
 diff --git c/crates/lianli-media/src/custom/helpers/mod.rs w/crates/lianli-media/src/custom/helpers/mod.rs
-index 343be2f..6594558 100644
+index 343be2f..4c8f5d3 100644
 --- c/crates/lianli-media/src/custom/helpers/mod.rs
 +++ w/crates/lianli-media/src/custom/helpers/mod.rs
-@@ -7,7 +7,8 @@ mod text;
+@@ -6,8 +6,9 @@ mod formatting;
+ mod text;
  
  pub(super) use drawing::{
-     blit_with_opacity, draw_annulus, fast_overlay, fast_resize_rgba, fill_rect_clipped_rounded,
+-    blit_with_opacity, draw_annulus, fast_overlay, fast_resize_rgba, fill_rect_clipped_rounded,
 -    fill_rounded_rect, fit_image, range_color, range_color_blended, unit_interval,
-+    fill_rounded_rect, fit_image, premultiplied_crossfade, range_color, range_color_blended,
-+    unit_interval,
++    blit_with_opacity, compute_overlay_spans, draw_annulus, fast_overlay, fast_overlay_opaque,
++    fast_overlay_with_spans, fast_resize_rgba, fill_rect_clipped_rounded, fill_rounded_rect,
++    fit_image, premultiplied_crossfade, range_color, range_color_blended, unit_interval, RowSpans,
  };
  pub(super) use fonts::{load_font_from_disk, resolve_font, widget_font_refs};
  pub(super) use formatting::{format_sensor_readout, render_value_format};
 diff --git c/crates/lianli-media/src/custom/widgets/mod.rs w/crates/lianli-media/src/custom/widgets/mod.rs
-index a1f261b..b396a43 100644
+index a1f261b..2d1897c 100644
 --- c/crates/lianli-media/src/custom/widgets/mod.rs
 +++ w/crates/lianli-media/src/custom/widgets/mod.rs
-@@ -16,7 +16,9 @@ pub(super) mod speedometer;
+@@ -16,7 +16,10 @@ pub(super) mod speedometer;
  pub(super) mod value_text;
  pub(super) mod video_widget;
  
 -use super::helpers::{fast_overlay, fast_resize_rgba, resolve_font, widget_size_px};
 +use super::helpers::{
-+    fast_overlay, fast_resize_rgba, premultiplied_crossfade, resolve_font, widget_size_px,
++    compute_overlay_spans, fast_overlay, fast_overlay_with_spans, fast_resize_rgba,
++    premultiplied_crossfade, resolve_font, widget_size_px, RowSpans,
 +};
  use ab_glyph::FontVec;
  use fast_image_resize::FilterType as FirFilter;
  use image::{Rgba, RgbaImage};
-@@ -29,13 +31,47 @@ use std::sync::atomic::AtomicBool;
+@@ -29,13 +32,88 @@ use std::sync::atomic::AtomicBool;
  use std::sync::Arc;
  use std::time::{Duration, Instant};
  
@@ -948,6 +1369,47 @@ index a1f261b..b396a43 100644
 +    pub mix: u8,
 +}
 +
++/// Decoded frames of the active clip, so short loops (mascot animations)
++/// decode once instead of on every replay. `bytes` is capped: full-canvas
++/// frames exceed `SINGLE_FRAME_BYTES` and degrade to the previous
++/// one-frame-at-a-time behavior, so the big background video never hoards RAM.
++pub(super) struct VideoFrameCache {
++    pub clip_key: String,
++    pub frames: HashMap<usize, (RgbaImage, bool)>,
++    pub bytes: usize,
++    pub last_idx: usize,
++}
++
++impl VideoFrameCache {
++    /// Per-frame size above which only the latest frame is kept.
++    pub const SINGLE_FRAME_BYTES: usize = 4 << 20;
++    /// Total decoded bytes kept per widget before the cache resets.
++    pub const MAX_BYTES: usize = 48 << 20;
++
++    pub fn get(&self, clip_key: &str, idx: usize) -> Option<&(RgbaImage, bool)> {
++        if self.clip_key == clip_key {
++            self.frames.get(&idx)
++        } else {
++            None
++        }
++    }
++
++    pub fn insert(&mut self, clip_key: &str, idx: usize, frame: RgbaImage, opaque: bool) {
++        let frame_bytes = frame.as_raw().len();
++        if self.clip_key != clip_key
++            || frame_bytes >= Self::SINGLE_FRAME_BYTES
++            || self.bytes + frame_bytes > Self::MAX_BYTES
++        {
++            self.frames.clear();
++            self.bytes = 0;
++            self.clip_key = clip_key.to_string();
++        }
++        self.bytes += frame_bytes;
++        self.frames.insert(idx, (frame, opaque));
++        self.last_idx = idx;
++    }
++}
++
  pub(super) struct WidgetState {
      pub resolved_sensor: Option<ResolvedSensor>,
      pub loaded_image: Option<RgbaImage>,
@@ -957,7 +1419,7 @@ index a1f261b..b396a43 100644
 +    /// JPEG-compressed frames for large (full-canvas) videos; decoded on
 +    /// demand into `video_frame_cache` so RAM stays at one frame.
 +    pub video_frames_jpeg: Option<Arc<Vec<Vec<u8>>>>,
-+    pub video_frame_cache: Option<(String, usize, RgbaImage)>,
++    pub video_frame_cache: Option<VideoFrameCache>,
      pub video_frame_durations: Option<Arc<Vec<Duration>>>,
      pub video_total_ms: u64,
      pub video_fps_cap_ms: Option<u64>,
@@ -975,7 +1437,17 @@ index a1f261b..b396a43 100644
      pub last_video_render_ms: Option<u64>,
      pub last_render_text: Option<String>,
      pub last_quantized: i32,
-@@ -57,9 +93,23 @@ impl WidgetState {
+@@ -49,6 +127,9 @@ pub(super) struct WidgetState {
+     pub last_video_frame_idx: Option<usize>,
+     pub cached_render: Option<RgbaImage>,
+     pub cached_render_key: Option<u64>,
++    /// Non-transparent runs of `cached_render`, so repeat blits of large
++    /// sparse overlays (e.g. the panels image) skip transparent pixels.
++    pub cached_render_spans: Option<RowSpans>,
+ }
+ 
+ impl WidgetState {
+@@ -57,9 +138,23 @@ impl WidgetState {
              resolved_sensor: None,
              loaded_image: None,
              video_frames: None,
@@ -999,7 +1471,15 @@ index a1f261b..b396a43 100644
              last_video_render_ms: None,
              last_render_text: None,
              last_quantized: i32::MIN,
-@@ -95,7 +145,15 @@ fn render_key(kind: &WidgetKind, state: &WidgetState) -> u64 {
+@@ -73,6 +168,7 @@ impl WidgetState {
+             last_video_frame_idx: None,
+             cached_render: None,
+             cached_render_key: None,
++            cached_render_spans: None,
+         }
+     }
+ }
+@@ -95,7 +191,15 @@ fn render_key(kind: &WidgetKind, state: &WidgetState) -> u64 {
              }
          }
          WidgetKind::CoreBars { .. } => state.cached_core_usage.hash(&mut h),
@@ -1016,7 +1496,7 @@ index a1f261b..b396a43 100644
          WidgetKind::ClockDigital { .. } | WidgetKind::ClockAnalog { .. } => {
              state.last_clock_key.hash(&mut h)
          }
-@@ -120,9 +178,18 @@ pub(super) fn draw_widget(
+@@ -120,14 +224,47 @@ pub(super) fn draw_widget(
          return;
      }
  
@@ -1034,10 +1514,40 @@ index a1f261b..b396a43 100644
 -    let tl_y = offset_y + (widget.y * uniform_scale).round() as i32 - wh_i / 2;
 +    let tl_x = offset_x + (center_x * uniform_scale).round() as i32 - ww_i / 2;
 +    let tl_y = offset_y + (center_y * uniform_scale).round() as i32 - wh_i / 2;
++
++    // Unrotated, untransitioned, full-opacity video widgets bypass the
++    // scratch canvas, the double blit, and cached_render (which a 24fps
++    // frame advance would invalidate anyway): the decoded frame is blitted
++    // straight onto the canvas, as plain row copies when it is opaque.
++    if let WidgetKind::Video { opacity, .. } = &widget.kind {
++        if widget.rotation.abs() <= 0.5
++            && *opacity >= 1.0
++            && state.video_transition.is_none()
++            && video_widget::draw_direct(frame, state, tl_x as i64, tl_y as i64, ww, wh)
++        {
++            if state.cached_render.is_some() {
++                state.cached_render = None;
++                state.cached_render_key = None;
++                state.cached_render_spans = None;
++            }
++            return;
++        }
++    }
  
      let key = render_key(&widget.kind, state);
      if state.cached_render_key == Some(key) {
-@@ -486,7 +553,7 @@ pub(super) fn draw_widget(
+         if let Some(cached) = &state.cached_render {
+-            fast_overlay(frame, cached, tl_x as i64, tl_y as i64);
++            match &state.cached_render_spans {
++                Some(spans) => {
++                    fast_overlay_with_spans(frame, cached, tl_x as i64, tl_y as i64, spans)
++                }
++                None => fast_overlay(frame, cached, tl_x as i64, tl_y as i64),
++            }
+             return;
+         }
+     }
+@@ -486,7 +623,7 @@ pub(super) fn draw_widget(
          sub
      };
  
@@ -1046,7 +1556,7 @@ index a1f261b..b396a43 100644
          rotate_about_center(
              &sub,
              widget.rotation.to_radians(),
-@@ -497,7 +564,48 @@ pub(super) fn draw_widget(
+@@ -497,7 +634,49 @@ pub(super) fn draw_widget(
          sub
      };
  
@@ -1056,6 +1566,7 @@ index a1f261b..b396a43 100644
 +    }
 +
      fast_overlay(frame, &final_overlay, tl_x as i64, tl_y as i64);
++    state.cached_render_spans = compute_overlay_spans(&final_overlay);
      state.cached_render = Some(final_overlay);
      state.cached_render_key = Some(key);
  }
@@ -1096,19 +1607,29 @@ index a1f261b..b396a43 100644
 +    }
 +}
 diff --git c/crates/lianli-media/src/custom/widgets/video_widget.rs w/crates/lianli-media/src/custom/widgets/video_widget.rs
-index 797c2dd..8699dfa 100644
+index 797c2dd..b74c00a 100644
 --- c/crates/lianli-media/src/custom/widgets/video_widget.rs
 +++ w/crates/lianli-media/src/custom/widgets/video_widget.rs
-@@ -4,13 +4,55 @@ use super::super::helpers::blit_with_opacity;
- use super::WidgetState;
+@@ -1,17 +1,177 @@
+ //! Looping video frame overlay.
+ 
+-use super::super::helpers::blit_with_opacity;
+-use super::WidgetState;
++use super::super::helpers::{blit_with_opacity, fast_overlay, fast_overlay_opaque};
++use super::{VideoFrameCache, WidgetState};
  use image::RgbaImage;
++use std::sync::Arc;
  
 -pub(in super::super) fn draw(sub: &mut RgbaImage, state: &WidgetState, opacity: f32) {
 -    if let Some(frames) = &state.video_frames {
-+pub(in super::super) fn draw(sub: &mut RgbaImage, state: &mut WidgetState, opacity: f32) {
-+    let idx = state.last_video_frame_idx.unwrap_or(0);
-+    let clip_key = state.active_video_variant.clone().unwrap_or_default();
-+    let (frames, pngs, jpegs) = state
++type FrameSources = (
++    Option<Arc<Vec<RgbaImage>>>,
++    Option<Arc<Vec<Vec<u8>>>>,
++    Option<Arc<Vec<Vec<u8>>>>,
++);
++
++fn frame_sources(state: &WidgetState) -> FrameSources {
++    state
 +        .active_video_variant
 +        .as_ref()
 +        .and_then(|key| state.video_variants.get(key))
@@ -1125,26 +1646,83 @@ index 797c2dd..8699dfa 100644
 +                state.video_frames_png.clone(),
 +                state.video_frames_jpeg.clone(),
 +            )
-+        });
++        })
++}
 +
-+    // Lossless PNG selector frames and JPEG video frames share one decoded
-+    // frame cache. `load_from_memory` detects either format.
++/// Decode frame `idx` into `state.video_frame_cache` unless it is already
++/// there. Returns false when the frame cannot be decoded.
++///
++/// JPEG frames decode via SIMD libjpeg-turbo straight into RGBA (alpha is
++/// guaranteed 0xFF, so blits may take the opaque row-copy path); PNG selector
++/// frames keep the image crate for real alpha.
++fn ensure_decoded(
++    state: &mut WidgetState,
++    idx: usize,
++    clip_key: &str,
++    encoded_frames: &[Vec<u8>],
++) -> bool {
++    if let Some(cache) = &mut state.video_frame_cache {
++        if cache.get(clip_key, idx).is_some() {
++            cache.last_idx = idx;
++            return true;
++        }
++    }
++    let bytes = &encoded_frames[idx];
++    let decoded = if bytes.starts_with(&[0xFF, 0xD8]) {
++        turbojpeg::decompress(bytes, turbojpeg::PixelFormat::RGBA)
++            .ok()
++            .filter(|img| img.pitch == img.width * 4)
++            .and_then(|img| {
++                RgbaImage::from_raw(img.width as u32, img.height as u32, img.pixels)
++                    .map(|frame| (frame, true))
++            })
++    } else {
++        None
++    };
++    let decoded = decoded.or_else(|| {
++        image::load_from_memory(bytes)
++            .ok()
++            .map(|img| (img.to_rgba8(), false))
++    });
++    match decoded {
++        Some((frame, opaque)) => {
++            match &mut state.video_frame_cache {
++                Some(cache) => cache.insert(clip_key, idx, frame, opaque),
++                None => {
++                    let mut cache = VideoFrameCache {
++                        clip_key: clip_key.to_string(),
++                        frames: std::collections::HashMap::new(),
++                        bytes: 0,
++                        last_idx: idx,
++                    };
++                    cache.insert(clip_key, idx, frame, opaque);
++                    state.video_frame_cache = Some(cache);
++                }
++            }
++            true
++        }
++        None => false,
++    }
++}
++
++pub(in super::super) fn draw(sub: &mut RgbaImage, state: &mut WidgetState, opacity: f32) {
++    let idx = state.last_video_frame_idx.unwrap_or(0);
++    let clip_key = state.active_video_variant.clone().unwrap_or_default();
++    let (frames, pngs, jpegs) = frame_sources(state);
++
 +    if let Some(encoded_frames) = pngs.or(jpegs) {
 +        if encoded_frames.is_empty() {
 +            return;
 +        }
 +        let idx = idx.min(encoded_frames.len() - 1);
-+        let cached = matches!(
-+            &state.video_frame_cache,
-+            Some((key, i, _)) if key == &clip_key && *i == idx
-+        );
-+        if !cached {
-+            match image::load_from_memory(&encoded_frames[idx]) {
-+                Ok(img) => state.video_frame_cache = Some((clip_key.clone(), idx, img.to_rgba8())),
-+                Err(_) => return,
-+            }
++        if !ensure_decoded(state, idx, &clip_key, &encoded_frames) {
++            return;
 +        }
-+        if let Some((_, _, frame)) = &state.video_frame_cache {
++        if let Some((frame, _)) = state
++            .video_frame_cache
++            .as_ref()
++            .and_then(|cache| cache.get(&clip_key, idx))
++        {
 +            blit_with_opacity(sub, frame, opacity);
 +        }
 +        return;
@@ -1161,6 +1739,63 @@ index 797c2dd..8699dfa 100644
              blit_with_opacity(sub, &frames[idx], opacity);
          }
      }
+ }
++
++/// Fast path for unrotated, untransitioned, full-opacity video widgets: blit
++/// the decoded frame straight onto the canvas, skipping draw_widget's
++/// full-canvas scratch allocation and its second overlay pass. Returns false
++/// when the frame size doesn't match the widget (caller falls back to the
++/// general path, which crops).
++pub(in super::super) fn draw_direct(
++    canvas: &mut RgbaImage,
++    state: &mut WidgetState,
++    tl_x: i64,
++    tl_y: i64,
++    ww: u32,
++    wh: u32,
++) -> bool {
++    let idx = state.last_video_frame_idx.unwrap_or(0);
++    let clip_key = state.active_video_variant.clone().unwrap_or_default();
++    let (frames, pngs, jpegs) = frame_sources(state);
++
++    if let Some(encoded_frames) = pngs.or(jpegs) {
++        if encoded_frames.is_empty() {
++            return true;
++        }
++        let idx = idx.min(encoded_frames.len() - 1);
++        if !ensure_decoded(state, idx, &clip_key, &encoded_frames) {
++            return true;
++        }
++        let Some((frame, opaque)) = state
++            .video_frame_cache
++            .as_ref()
++            .and_then(|cache| cache.get(&clip_key, idx))
++        else {
++            return true;
++        };
++        if frame.width() != ww || frame.height() != wh {
++            return false;
++        }
++        if *opaque {
++            fast_overlay_opaque(canvas, frame, tl_x, tl_y);
++        } else {
++            fast_overlay(canvas, frame, tl_x, tl_y);
++        }
++        return true;
++    }
++
++    if let Some(frames) = frames {
++        if !frames.is_empty() {
++            let idx = idx.min(frames.len() - 1);
++            let frame = &frames[idx];
++            if frame.width() != ww || frame.height() != wh {
++                return false;
++            }
++            fast_overlay(canvas, frame, tl_x, tl_y);
++        }
++    }
++    true
++}
 diff --git c/crates/lianli-media/src/video/mod.rs w/crates/lianli-media/src/video/mod.rs
 index 64a9b40..e313804 100644
 --- c/crates/lianli-media/src/video/mod.rs
